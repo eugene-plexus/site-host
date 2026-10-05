@@ -1,0 +1,108 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "eugene-plexus-site-host"
+version = "0.1.0"
+description = "Eugene Plexus site host: a machine's local MCP host, whose policy is final on that machine."
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.12"
+authors = [
+    { name = "Eugene Plexus contributors" },
+]
+keywords = ["eugene-plexus", "mcp", "model-context-protocol", "job-site", "files"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Framework :: FastAPI",
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+
+dependencies = [
+    # The official SDK owns MCP: the 2026-07-28 single exchange the root's
+    # requests arrive in, and the handshake to local stdio servers (J6c).
+    # Workbench pins the same series (C5).
+    "mcp>=2.3,<2.4",
+    "fastapi>=0.115,<1",
+    "uvicorn>=0.32,<1",
+    "pydantic>=2.9,<3",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest==8.4.2",
+    "pytest-asyncio==0.26.0",
+    "ruff==0.15.14",
+    "mypy==1.20.2",
+    "datamodel-code-generator==0.57.0",
+    "httpx>=0.27,<1",
+]
+
+[project.scripts]
+eugene-plexus-site-host = "eugene_plexus_site_host.__main__:main"
+
+[project.urls]
+Homepage = "https://github.com/eugene-plexus"
+Repository = "https://github.com/eugene-plexus/site-host"
+Specs = "https://github.com/eugene-plexus/specs"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/eugene_plexus_site_host"]
+
+# -----------------------------------------------------------------------------
+# Ruff (linter + formatter)
+# -----------------------------------------------------------------------------
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+extend-exclude = [
+    "src/eugene_plexus_site_host/_generated",
+]
+
+[tool.ruff.lint]
+select = [
+    "E", "F", "W",   # pycodestyle / pyflakes
+    "I",             # isort
+    "B",             # bugbear
+    "UP",            # pyupgrade
+    "ASYNC",         # async-correctness
+    "SIM",           # simplifications
+    "RUF",
+]
+ignore = []
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["E501"]
+
+# -----------------------------------------------------------------------------
+# Mypy
+# -----------------------------------------------------------------------------
+[tool.mypy]
+python_version = "3.12"
+disable_error_code = ["call-arg"]
+warn_unused_configs = true
+warn_unused_ignores = true
+warn_return_any = true
+warn_redundant_casts = true
+disallow_untyped_defs = true
+no_implicit_optional = true
+check_untyped_defs = true
+exclude = [
+    "src/eugene_plexus_site_host/_generated",
+]
+
+[[tool.mypy.overrides]]
+module = "eugene_plexus_site_host._generated.*"
+ignore_errors = true
+
+# -----------------------------------------------------------------------------
+# Pytest
+# -----------------------------------------------------------------------------
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+addopts = "-ra --strict-markers"
