@@ -10,11 +10,14 @@ state and never the host's to change:
 - **The local servers**: written by a machine administrator, proven elevated,
   into the install's protected configuration, which the host's own account
   cannot write (§6.2). A server marked `system` carries that administrator's
-  consent (J9).
+  consent (J9). The agent copies them to a file the host may read and not
+  write, and names its SHA-256 here; a file that differs is refused.
 """
 
 from __future__ import annotations
 
+import hashlib
+import hmac
 import json
 import os
 import sys
@@ -61,6 +64,24 @@ class Settings:
         return None
 
 
+def _local_servers_text(values: Mapping[str, str]) -> str:
+    """The local servers, as JSON. The agent writes them to a file this
+    account may read and not write, beside the host's install, and names
+    the file and its SHA-256 here: a list may be longer than one variable
+    holds, and the hash is what the agent says, not what the file says."""
+    name = values.get("SITE_HOST_LOCAL_SERVERS_FILE")
+    if not name:
+        return "[]"
+    expected = values.get("SITE_HOST_LOCAL_SERVERS_SHA256", "")
+    try:
+        data = Path(name).read_bytes()
+    except OSError as exc:
+        raise SettingsError(f"the local servers file could not be read: {exc.strerror}") from None
+    if not hmac.compare_digest(hashlib.sha256(data).hexdigest(), expected):
+        raise SettingsError("the local servers file is not the one the agent wrote")
+    return data.decode("utf-8")
+
+
 def from_environment(env: Mapping[str, str] | None = None) -> Settings:
     values = os.environ if env is None else env
     try:
@@ -79,7 +100,7 @@ def from_environment(env: Mapping[str, str] | None = None) -> Settings:
         raise SettingsError("a job site's host needs its owner (SITE_HOST_OWNER)")
     try:
         roots = json.loads(values.get("SITE_HOST_PROTECTED_ROOTS", "[]"))
-        raw_servers = json.loads(values.get("SITE_HOST_LOCAL_SERVERS", "[]"))
+        raw_servers = json.loads(_local_servers_text(values))
         servers = tuple(SiteLocalServer.model_validate(s) for s in raw_servers)
     except (ValueError, ValidationError, TypeError) as exc:
         raise SettingsError(f"the agent's lists could not be read: {type(exc).__name__}") from None
