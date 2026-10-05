@@ -27,7 +27,7 @@ class SiteLocalServer(BaseModel):
     )
     id: str = Field(
         ...,
-        description="Its id on this site. Ids beginning `files` are Eugene's own.",
+        description="Its id on this site. An id beginning `files` is refused; `files` is Eugene's own file server.",
         pattern='^[a-z][a-z0-9-]{0,39}$',
     )
     name: str = Field(..., max_length=80, min_length=1)
@@ -71,21 +71,25 @@ class SiteHostProtocol(StrEnum):
     mcp_2026_07_28 = 'mcp-2026-07-28'
 
 
-class SiteFolder(BaseModel):
+class SiteFolderPerson(BaseModel):
     model_config = ConfigDict(
         extra='forbid',
     )
-    id: str = Field(..., pattern='^[a-f0-9]{32}$')
-    name: str = Field(..., max_length=80, min_length=1)
-    path: str = Field(..., max_length=4096, min_length=1)
+    subject: str = Field(
+        ...,
+        description="A person's id. Never `operator`; Eugene's owner reaches a site only through `ownerInDevMode`.",
+        max_length=64,
+        min_length=1,
+    )
     writable: bool = Field(
-        ..., description='Whether its server offers `write_text` at all.'
+        ...,
+        description='The person may change files in it: a standing pre-approval for\n`write_text` (J6b). Otherwise they may list and read.\n',
     )
 
 
 class SiteServerKind(StrEnum):
     """
-    `files`: Eugene's own file server, one per registered folder. `local`: a server a machine administrator added at the machine.
+    `files`: Eugene's own file server, one per machine, its tools taking a `folder` argument (J6g). `local`: a server a machine administrator added at the machine.
     """
 
     files = 'files'
@@ -132,16 +136,24 @@ class McpMethod(StrEnum):
 
 class SiteGrantHint(BaseModel):
     """
-    The root's own grant, carried with a call: on an ordinary node, where the
-    root's grant is final (J6d); and on a job site for Eugene's owner in dev
-    mode, which the site honours only if its owner opted in (J6e).
+    One of the root's own folder grants, carried with a call in a list
+    (`grants`): on an ordinary node, all of the person's grants there, the
+    root's grant being final (J6d); on a job site, Eugene's owner's dev-mode
+    grants, which the site honours only if its owner opted in (J6e). The
+    host checks the folder a call names against them.
 
     """
 
     model_config = ConfigDict(
         extra='forbid',
     )
-    folderId: str = Field(..., pattern='^[a-f0-9]{32}$')
+    folderId: str = Field(..., max_length=64, min_length=1)
+    name: str = Field(
+        ...,
+        description="The folder's name on this machine, as the `folder` argument takes it. The root makes it unique; a folder that shares a name with an earlier one reads `Name (2)`.",
+        max_length=96,
+        min_length=1,
+    )
     path: str = Field(..., max_length=4096, min_length=1)
     identity: str = Field(..., max_length=256, min_length=1)
     writable: bool
@@ -158,11 +170,16 @@ class SiteManageAction(StrEnum):
       check a folder can be opened, and return its full path and
       identity for the root to register.
     - `folder.add` (`SiteFolderAdd`), site mode, from the owner:
-      register a folder here; its server is `files.<id>`.
+      register a folder here, under a name no other folder here has. It
+      returns `SiteFolder`, with nobody on its list.
     - `folder.remove` (`SiteFolderRemove`), site mode, from the owner.
+    - `folder.people` (`SiteFolderPeople`), site mode, from the owner:
+      who may use one folder, and who may change files in it, replacing
+      what was there. It returns `SiteFolder`.
     - `access.set` (`SiteAccessSet`), site mode, from the owner: who may
-      use one server, and which tools, replacing what was there.
-    - `server.enable` (`SiteServerEnable`), site mode, from the owner.
+      use one local server, and which tools, replacing what was there.
+    - `server.enable` (`SiteServerEnable`), site mode, from the owner: a
+      local server on or off.
     - `settings.set` (`SiteSettings`), site mode, from the owner.
     - `audit.read` (`SiteAuditRead`), site mode, from the owner: the
       newest entries of the site's audit log.
@@ -172,6 +189,7 @@ class SiteManageAction(StrEnum):
     folder_inspect = 'folder.inspect'
     folder_add = 'folder.add'
     folder_remove = 'folder.remove'
+    folder_people = 'folder.people'
     access_set = 'access.set'
     server_enable = 'server.enable'
     settings_set = 'settings.set'
@@ -223,6 +241,18 @@ class SiteFolderRemove(BaseModel):
     id: str = Field(..., pattern='^[a-f0-9]{32}$')
 
 
+class SiteFolderPeople(BaseModel):
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    id: str = Field(..., pattern='^[a-f0-9]{32}$')
+    people: list[SiteFolderPerson] = Field(
+        ...,
+        description="Each person once. `writable` cannot exceed the folder's.",
+        max_length=256,
+    )
+
+
 class SitePersonTools(BaseModel):
     model_config = ConfigDict(
         extra='forbid',
@@ -232,14 +262,18 @@ class SitePersonTools(BaseModel):
 
 
 class SiteAccessSet(BaseModel):
+    """
+    A local server's list. Eugene's file server is granted per folder (`folder.people`).
+    """
+
     model_config = ConfigDict(
         extra='forbid',
     )
     server: str = Field(
         ...,
-        description="A server on the site. `files.<folder id>` for each folder registered on\nit (Eugene's own file server, one per folder); otherwise the id a machine\nadministrator gave a local server when adding it at the machine.\n",
+        description="A server on the machine. `files` is Eugene's own file server, one per\nmachine, whose tools take a `folder` argument (J6g). Any other id is one\na machine administrator gave a local server when adding it at the\nmachine; no local server's id begins `files`.\n",
         max_length=40,
-        pattern='^(files\\.[a-f0-9]{32}|[a-z][a-z0-9-]{0,39})$',
+        pattern='^(files|[a-z][a-z0-9-]{0,39})$',
     )
     people: list[SitePersonTools] = Field(..., max_length=256)
 
@@ -250,9 +284,9 @@ class SiteServerEnable(BaseModel):
     )
     server: str = Field(
         ...,
-        description="A server on the site. `files.<folder id>` for each folder registered on\nit (Eugene's own file server, one per folder); otherwise the id a machine\nadministrator gave a local server when adding it at the machine.\n",
+        description="A server on the machine. `files` is Eugene's own file server, one per\nmachine, whose tools take a `folder` argument (J6g). Any other id is one\na machine administrator gave a local server when adding it at the\nmachine; no local server's id begins `files`.\n",
         max_length=40,
-        pattern='^(files\\.[a-f0-9]{32}|[a-z][a-z0-9-]{0,39})$',
+        pattern='^(files|[a-z][a-z0-9-]{0,39})$',
     )
     enabled: bool
 
@@ -321,6 +355,12 @@ class SiteLocalServerList(BaseModel):
 
 
 class SiteAccess(BaseModel):
+    """
+    Who may use which tools of one local server. Eugene's file server is
+    granted per folder instead (`SiteFolder.people`, J6g).
+
+    """
+
     model_config = ConfigDict(
         extra='forbid',
     )
@@ -332,11 +372,41 @@ class SiteAccess(BaseModel):
     )
     server: str = Field(
         ...,
-        description="A server on the site. `files.<folder id>` for each folder registered on\nit (Eugene's own file server, one per folder); otherwise the id a machine\nadministrator gave a local server when adding it at the machine.\n",
+        description="A server on the machine. `files` is Eugene's own file server, one per\nmachine, whose tools take a `folder` argument (J6g). Any other id is one\na machine administrator gave a local server when adding it at the\nmachine; no local server's id begins `files`.\n",
         max_length=40,
-        pattern='^(files\\.[a-f0-9]{32}|[a-z][a-z0-9-]{0,39})$',
+        pattern='^(files|[a-z][a-z0-9-]{0,39})$',
     )
     tools: list[SiteToolGrant] = Field(..., max_length=64)
+
+
+class SiteFolder(BaseModel):
+    """
+    A folder registered on the machine. Eugene's file server offers it to
+    the people on its list, by its name, as its tools' `folder` argument
+    (J6g).
+
+    """
+
+    model_config = ConfigDict(
+        extra='forbid',
+    )
+    id: str = Field(..., pattern='^[a-f0-9]{32}$')
+    name: str = Field(
+        ...,
+        description='Unique on the machine, and the value of the `folder` argument. A\nfolder that shares a name with one registered before it is shown,\nand taken, as `Name (2)`, `Name (3)` and so on.\n',
+        max_length=96,
+        min_length=1,
+    )
+    path: str = Field(..., max_length=4096, min_length=1)
+    writable: bool = Field(
+        ...,
+        description="Whether anyone may change files in it at all. A person's `writable` cannot exceed it.",
+    )
+    people: list[SiteFolderPerson] = Field(
+        ...,
+        description="Who may use it, the site's owner included (J11). Nobody is on it until the owner says so.",
+        max_length=256,
+    )
 
 
 class SiteServer(BaseModel):
@@ -345,9 +415,9 @@ class SiteServer(BaseModel):
     )
     id: str = Field(
         ...,
-        description="A server on the site. `files.<folder id>` for each folder registered on\nit (Eugene's own file server, one per folder); otherwise the id a machine\nadministrator gave a local server when adding it at the machine.\n",
+        description="A server on the machine. `files` is Eugene's own file server, one per\nmachine, whose tools take a `folder` argument (J6g). Any other id is one\na machine administrator gave a local server when adding it at the\nmachine; no local server's id begins `files`.\n",
         max_length=40,
-        pattern='^(files\\.[a-f0-9]{32}|[a-z][a-z0-9-]{0,39})$',
+        pattern='^(files|[a-z][a-z0-9-]{0,39})$',
     )
     name: str = Field(..., max_length=80, min_length=1)
     kind: SiteServerKind
@@ -357,7 +427,7 @@ class SiteServer(BaseModel):
     )
     enabled: bool = Field(
         ...,
-        description="Whether the site's owner has turned it on. A folder's server is on while the folder is registered.",
+        description="Whether it is on. Eugene's file server is on while a folder is registered; a local server is on once the site's owner turns it on.",
     )
     available: bool = Field(..., description='Whether it can run now.')
     reason: str | None = Field(
@@ -449,7 +519,11 @@ class SiteSummary(BaseModel):
     )
     folders: list[SiteFolder] = Field(..., max_length=64)
     servers: list[SiteServer] = Field(..., max_length=96)
-    access: list[SiteAccess] = Field(..., max_length=2048)
+    access: list[SiteAccess] = Field(
+        ...,
+        description="Who may use the local servers' tools. Folders carry their own people.",
+        max_length=2048,
+    )
 
 
 class SiteCall(BaseModel):
@@ -471,14 +545,15 @@ class SiteCall(BaseModel):
     )
     server: str = Field(
         ...,
-        description="A server on the site. `files.<folder id>` for each folder registered on\nit (Eugene's own file server, one per folder); otherwise the id a machine\nadministrator gave a local server when adding it at the machine.\n",
+        description="A server on the machine. `files` is Eugene's own file server, one per\nmachine, whose tools take a `folder` argument (J6g). Any other id is one\na machine administrator gave a local server when adding it at the\nmachine; no local server's id begins `files`.\n",
         max_length=40,
-        pattern='^(files\\.[a-f0-9]{32}|[a-z][a-z0-9-]{0,39})$',
+        pattern='^(files|[a-z][a-z0-9-]{0,39})$',
     )
     request: McpRequest
-    grant: SiteGrantHint | None = Field(
+    grants: list[SiteGrantHint] | None = Field(
         None,
-        description="The root's grant, on a node; Eugene's owner's dev-mode grant, on a site.",
+        description="The person's grants on this machine, on a node; Eugene's owner's dev-mode grants, on a site. Empty otherwise.",
+        max_length=64,
     )
     installMode: InstallModeName
 

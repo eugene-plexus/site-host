@@ -28,7 +28,7 @@ def test_a_large_body_is_refused_unread(tmp_path: Path) -> None:
         "id": "x",
         "expiresAt": time.time() + 20,
         "subject": ADA,
-        "server": "files." + "a" * 32,
+        "server": "files",
         "request": rpc("tools/call", {"name": "read_text", "arguments": {"path": "a" * 70_000}}),
         "installMode": "production",
     }
@@ -60,3 +60,25 @@ def test_a_site_starts_only_knowing_its_owner(tmp_path: Path) -> None:
         pass
     else:
         raise AssertionError("a node took local servers")
+
+
+def test_a_local_server_cannot_take_the_file_servers_name(tmp_path: Path) -> None:
+    env = {
+        "EUGENE_PLEXUS_APP_DATA_DIR": str(tmp_path),
+        "EUGENE_PLEXUS_APP_BIND_PORT": "8300",
+        "EUGENE_PLEXUS_APP_ADMIN_TOKEN": "t",
+        "EUGENE_PLEXUS_APP_ACCOUNT_KIND": KIND,
+        "SITE_HOST_MODE": "site",
+        "SITE_HOST_OWNER": ADA,
+        "SITE_HOST_LOCAL_SERVERS": (
+            '[{"id": "files-extra", "name": "X", "command": "/bin/x", "sha256": "'
+            + "a" * 64
+            + '"}]'
+        ),
+    }
+    try:
+        from_environment(env)
+    except SettingsError as exc:
+        assert "files" in str(exc)
+    else:
+        raise AssertionError("a local server took the file server's name")

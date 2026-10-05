@@ -68,7 +68,7 @@ class Site:
         method: str,
         params: dict[str, Any] | None = None,
         *,
-        grant: dict[str, Any] | None = None,
+        grants: list[dict[str, Any]] | None = None,
         mode: str = "production",
         request: dict[str, Any] | None = None,
         ident: str | None = None,
@@ -81,7 +81,7 @@ class Site:
                 "subject": subject,
                 "server": server,
                 "request": request or rpc(method, params),
-                "grant": grant,
+                "grants": grants or [],
                 "installMode": mode,
             }
         )

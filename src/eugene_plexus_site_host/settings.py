@@ -87,6 +87,8 @@ def from_environment(env: Mapping[str, str] | None = None) -> Settings:
         raise SettingsError("local servers run on a job site only")
     if len({s.id for s in servers}) != len(servers):
         raise SettingsError("two local servers share an id")
+    if any(s.id.startswith("files") for s in servers):
+        raise SettingsError("a local server's id begins 'files', which is Eugene's file server")
     protected = (data, Path(sys.prefix), Path(__file__).parent, *(Path(p) for p in roots))
     return Settings(
         data_dir=data,

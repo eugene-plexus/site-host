@@ -1,9 +1,14 @@
-"""Eugene's own file server: one MCP server for each registered folder.
+"""Eugene's own file server: one MCP server for the machine, `files` (J6g).
 
 The four tools the helper used to take as a bespoke `{tool, arguments}`
 command (`remote-nodes.md` §2.1) are MCP tools now, served by the SDK like
 any other server's (J6). `inspect` is not a tool: registering a folder is a
 management action (`folder.add`, or `folder.inspect` on an ordinary node).
+
+Each tool takes a `folder` argument, the folder's name on this machine. The
+server is built for one person and one request: the `folder` argument lists
+only the folders that person may use, and `write_text` appears, listing only
+the folders they may change, only when there is one.
 
 The folder code underneath is unchanged: it holds handles, refuses links,
 walks one name at a time, and on Linux confines each operation with
@@ -23,6 +28,7 @@ from mcp.server.lowlevel import Server
 
 from . import folder_io
 
+SERVER = "files"
 READ_ONLY = frozenset({"list_directory", "read_text"})
 DESTRUCTIVE = frozenset({"write_text"})
 
@@ -30,10 +36,14 @@ _PATH = {
     "type": "string",
     "minLength": 1,
     "maxLength": 1024,
-    "description": "Relative path inside this folder, using / separators. No .. or links.",
+    "description": "Relative path inside the folder, using / separators. No .. or links.",
 }
 _DEFINITIONS: tuple[tuple[str, str, dict[str, Any]], ...] = (
-    ("list_directory", "List up to 200 names. Use path '.' for this folder.", {"path": _PATH}),
+    (
+        "list_directory",
+        "List up to 200 names. Use path '.' for the folder itself.",
+        {"path": _PATH},
+    ),
     (
         "read_text",
         "Read a UTF-8 text file, at most 32 KiB/16384 characters, and its SHA-256.",
@@ -53,28 +63,38 @@ _DEFINITIONS: tuple[tuple[str, str, dict[str, Any]], ...] = (
 )
 
 
-def tools(writable: bool) -> list[types.Tool]:
-    """The folder's tools; `write_text` only on a writable folder."""
-    return [
-        types.Tool(
-            name=name,
-            description=description,
-            input_schema={
-                "type": "object",
-                "properties": properties,
-                "required": list(properties),
-                "additionalProperties": False,
-            },
-            annotations=types.ToolAnnotations(
-                read_only_hint=name in READ_ONLY,
-                destructive_hint=name in DESTRUCTIVE,
-                idempotent_hint=name in READ_ONLY,
-                open_world_hint=False,
-            ),
+def tools(readable: list[str], writable: list[str]) -> list[types.Tool]:
+    """The tools for one person: `folder` names only `readable` (for
+    `write_text`, only `writable`), and a tool with no folder is not offered."""
+    offered: list[types.Tool] = []
+    for name, description, properties in _DEFINITIONS:
+        names = writable if name == "write_text" else readable
+        if not names:
+            continue
+        folder = {
+            "type": "string",
+            "enum": list(names),
+            "description": "Which folder on this machine, by its name.",
+        }
+        offered.append(
+            types.Tool(
+                name=name,
+                description=description,
+                input_schema={
+                    "type": "object",
+                    "properties": {"folder": folder, **properties},
+                    "required": ["folder", *properties],
+                    "additionalProperties": False,
+                },
+                annotations=types.ToolAnnotations(
+                    read_only_hint=name in READ_ONLY,
+                    destructive_hint=name in DESTRUCTIVE,
+                    idempotent_hint=name in READ_ONLY,
+                    open_world_hint=False,
+                ),
+            )
         )
-        for name, description, properties in _DEFINITIONS
-        if name != "write_text" or writable
-    ]
+    return offered
 
 
 @dataclass
@@ -94,7 +114,8 @@ def _failure(message: str) -> types.CallToolResult:
 def run(
     path: str, identity: str, tool: str, arguments: dict[str, Any], protected: list[Path]
 ) -> dict[str, Any]:
-    """One operation, with the worker's argument rules (`folder_io`)."""
+    """One operation on one folder, with the worker's argument rules
+    (`folder_io`). `arguments` no longer carries `folder`."""
     if not isinstance(arguments.get("path"), str):
         raise folder_io.FolderError("A file operation needs a text path.")
     required = {"path", "text", "expectedSha256"} if tool == "write_text" else {"path"}
@@ -104,18 +125,26 @@ def run(
 
 
 def server(
-    folder: dict[str, Any], writable: bool, protected: list[Path], outcome: Outcome
+    folders: dict[str, dict[str, Any]],
+    writable: frozenset[str],
+    protected: list[Path],
+    outcome: Outcome,
 ) -> Server:
-    """An MCP server for one folder and one request."""
-    offered = {t.name: t for t in tools(writable)}
+    """The file server for one person and one request. `folders` maps each
+    name they may use to its record; `writable` names those they may change."""
+    offered = {t.name: t for t in tools(list(folders), [n for n in folders if n in writable])}
 
     async def list_tools(_ctx: Any, _params: Any) -> types.ListToolsResult:
         return types.ListToolsResult(tools=list(offered.values()))
 
     async def call_tool(_ctx: Any, params: types.CallToolRequestParams) -> types.CallToolResult:
         if params.name not in offered:
-            return _failure(f"This folder has no tool named {params.name!r}.")
+            return _failure(f"This machine's file server has no tool named {params.name!r}.")
         arguments = dict(params.arguments or {})
+        name = arguments.pop("folder", None)
+        folder = folders.get(name) if isinstance(name, str) else None
+        if folder is None or (params.name == "write_text" and name not in writable):
+            return _failure(f"You may not use a folder named {name!r} for {params.name}.")
         try:
             result = await asyncio.to_thread(
                 run, folder["path"], folder["identity"], params.name, arguments, protected
@@ -142,4 +171,19 @@ def server(
             is_error=False,
         )
 
-    return Server(f"files.{folder['id']}", on_list_tools=list_tools, on_call_tool=call_tool)
+    return Server(SERVER, on_list_tools=list_tools, on_call_tool=call_tool)
+
+
+def unique_names(names: list[str]) -> list[str]:
+    """Each name as the `folder` argument takes it: a name already taken,
+    ignoring case, by a folder before it reads `Name (2)`, `Name (3)`..."""
+    taken: set[str] = set()
+    out: list[str] = []
+    for name in names:
+        candidate, n = name, 1
+        while candidate.casefold() in taken:
+            n += 1
+            candidate = f"{name} ({n})"
+        taken.add(candidate.casefold())
+        out.append(candidate)
+    return out
