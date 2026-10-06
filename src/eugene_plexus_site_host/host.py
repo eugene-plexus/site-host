@@ -8,9 +8,9 @@ anything runs:
 2. It is one of the three methods of MCP 2026-07-28.
 3. Tools can run on this machine at all (an isolated account).
 4. The server exists and is on.
-5. The person may use it (`site` mode: this machine's own list; `node`
-   mode: the root's grants that came with the call). On the file server
-   that means at least one folder (J6g).
+5. The person may use it: this site's own list says so (rule 2 of
+   remote-nodes.md §3.3). On the file server that means at least one
+   folder (J6g).
 6. For `tools/call`: the tool is one the person may use, and a destructive
    tool has a standing pre-approval. On the file server, the `folder` it
    names is one they may use, and for `write_text` one they may change.
@@ -19,9 +19,8 @@ Then the SDK serves it, `tools/list` is cut to the person's tools (the file
 server's `folder` argument to their folders), and the call is recorded in
 the audit log, as every refusal is.
 
-A management action is taken from the owner this site pinned at its join,
-and from nobody else, Eugene's owner included (J6b). On an ordinary node the
-only action is the root's request to inspect a folder.
+A management action is taken from the owner this site recorded at its join,
+and from nobody else, Eugene's owner included (J6b).
 """
 
 from __future__ import annotations
@@ -46,7 +45,6 @@ from ._generated.models import (
     SiteAuditRead,
     SiteCall,
     SiteFolderAdd,
-    SiteFolderInspect,
     SiteFolderPeople,
     SiteFolderRemove,
     SiteGrantHint,
@@ -56,6 +54,7 @@ from ._generated.models import (
     SiteSettings,
 )
 from .audit import Audit
+from .identity import Identity
 from .local_servers import LocalServerError, LocalServers
 from .policy import Policy
 from .settings import Settings
@@ -117,12 +116,11 @@ class Target:
 
 
 class Host:
-    def __init__(self, settings: Settings) -> None:
+    def __init__(self, settings: Settings, identity: Identity | None = None) -> None:
         self.settings = settings
+        self.identity = identity or Identity(settings.data_dir)
         self.audit = Audit(settings.data_dir)
-        self.policy = (
-            Policy.load(settings.data_dir / "policy.json") if settings.mode == "site" else None
-        )
+        self.policy = Policy.load(settings.data_dir / "policy.json")
         self.local = LocalServers(settings.local_servers, settings.data_dir)
         self.lock = asyncio.Lock()
         self.used: dict[str, float] = {}
@@ -202,12 +200,9 @@ class Host:
 
     def _not_listed(self, target: Target) -> str:
         what = "any of its folders" if target.folders is not None else target.name
-        if self.settings.mode == "site":
-            return (
-                f"This machine's owner has not given you {what}. They can, from "
-                "Workbench (Job sites)."
-            )
-        return f"You have not been given {what}."
+        return (
+            f"This machine's owner has not given you {what}. They can, from Workbench (Job sites)."
+        )
 
     def _may_call(self, target: Target, tool: Any, arguments: Any) -> None:
         if target.folders is not None and tool == "write_text" and tool not in target.allowed:
@@ -235,11 +230,6 @@ class Host:
 
     async def _target(self, call: SiteCall) -> Target:
         server = str(call.server)
-        if self.settings.mode == "node":
-            if server != FILES:
-                raise Refused("This machine has no such server.")
-            return self._node_target(call)
-        assert self.policy is not None
         if server == FILES:
             if call.subject == OPERATOR:
                 return self._owner_in_dev_mode(call)
@@ -304,30 +294,9 @@ class Host:
     def _grants(call: SiteCall) -> list[SiteGrantHint]:
         return list(call.grants or [])
 
-    def _node_target(self, call: SiteCall) -> Target:
-        """An ordinary node: the root's grants are final, and come with the call."""
-        grants = self._grants(call)
-        names = file_server.unique_names([g.name for g in grants])
-        return self._files_target(
-            [
-                (
-                    name,
-                    {
-                        "id": g.folderId,
-                        "path": g.path,
-                        "identity": g.identity,
-                        "writable": g.writable,
-                    },
-                    g.writable,
-                )
-                for g, name in zip(grants, names, strict=True)
-            ]
-        )
-
     def _owner_in_dev_mode(self, call: SiteCall) -> Target:
         """Eugene's owner on a site: only in dev mode, only with grants the
         root holds for them, and only if this site's owner said so here (J6e)."""
-        assert self.policy is not None
         if not self.policy.owner_in_dev_mode:
             raise Refused(
                 "This machine's owner has not let Eugene's owner in. Dev mode alone opens "
@@ -365,21 +334,15 @@ class Host:
         }
         try:
             self._fresh(action.id, action.expiresAt)
-            if self.settings.mode == "node":
-                if name != "folder.inspect" or action.subject != OPERATOR:
-                    raise Refused(
-                        "On this machine, only Eugene's owner registers folders, from the console."
-                    )
-                result = await self._inspect(arguments)
-            else:
-                if name == "folder.inspect" or action.subject != self.settings.owner:
-                    raise Refused(
-                        "Only this machine's owner changes what it allows. They do it from "
-                        "Workbench (Job sites)."
-                    )
-                handler = self._handlers()[name]
-                async with self.lock:
-                    result = await handler(arguments)
+            owner = self.identity.owner()
+            if owner is None or action.subject != owner:
+                raise Refused(
+                    "Only this machine's owner changes what it allows. They do it from "
+                    "Workbench (Job sites)."
+                )
+            handler = self._handlers()[name]
+            async with self.lock:
+                result = await handler(arguments)
         except Refused as exc:
             self.audit.record(**entry, decision="refused", reason=str(exc))
             return {"status": "failed", "message": str(exc)}
@@ -430,13 +393,7 @@ class Host:
             ) from None
         return full, identity
 
-    async def _inspect(self, arguments: dict[str, Any]) -> dict[str, Any]:
-        value = self._parse(SiteFolderInspect, arguments)
-        path, identity = await self._open(value.path)
-        return {"path": path, "identity": identity}
-
     async def _folder_add(self, arguments: dict[str, Any]) -> dict[str, Any]:
-        assert self.policy is not None
         value = self._parse(SiteFolderAdd, arguments)
         name = value.name.strip()
         if not name or any(ord(c) < 32 for c in name):
@@ -460,7 +417,6 @@ class Host:
         return self._folder_view(self.policy.folder(str(folder["id"])) or folder)
 
     async def _folder_remove(self, arguments: dict[str, Any]) -> dict[str, Any]:
-        assert self.policy is not None
         value = self._parse(SiteFolderRemove, arguments)
         if self.policy.folder(value.id) is None:
             raise Refused("This folder is no longer registered.")
@@ -469,7 +425,6 @@ class Host:
 
     async def _folder_people(self, arguments: dict[str, Any]) -> dict[str, Any]:
         """Who may use one folder, and who may change files in it (J6g)."""
-        assert self.policy is not None
         value = self._parse(SiteFolderPeople, arguments)
         folder = self.policy.folder(value.id)
         if folder is None:
@@ -493,7 +448,6 @@ class Host:
 
     async def _offered(self, server: str) -> tuple[str, dict[str, types.Tool]]:
         """A local server's name and every tool it offers, for granting."""
-        assert self.policy is not None
         if server == FILES:
             raise Refused("Folders are given to people one by one, not through the file server.")
         local = self.local.entries.get(server)
@@ -512,7 +466,6 @@ class Host:
         return local.name, {t.name: t for t in listed}
 
     async def _access_set(self, arguments: dict[str, Any]) -> dict[str, Any]:
-        assert self.policy is not None
         value = self._parse(SiteAccessSet, arguments)
         server = str(value.server)
         name, offered = await self._offered(server)
@@ -544,7 +497,6 @@ class Host:
         return {"server": self._server_view(server), "people": self.policy.people(server)}
 
     async def _server_enable(self, arguments: dict[str, Any]) -> dict[str, Any]:
-        assert self.policy is not None
         value = self._parse(SiteServerEnable, arguments)
         server = str(value.server)
         if server == FILES:
@@ -568,7 +520,6 @@ class Host:
         return {"server": self._server_view(server), "people": self.policy.people(server)}
 
     async def _settings_set(self, arguments: dict[str, Any]) -> dict[str, Any]:
-        assert self.policy is not None
         value = self._parse(SiteSettings, arguments)
         self.policy.set_owner_in_dev_mode(value.ownerInDevMode)
         return {"ownerInDevMode": value.ownerInDevMode}
@@ -581,7 +532,6 @@ class Host:
     # --- report -----------------------------------------------------------------
 
     def _folder_view(self, folder: dict[str, Any]) -> dict[str, Any]:
-        assert self.policy is not None
         return {
             "id": folder["id"],
             "name": self.policy.names()[folder["id"]],
@@ -594,7 +544,6 @@ class Host:
         }
 
     def _files_view(self, reason: str | None) -> dict[str, Any]:
-        assert self.policy is not None
         names = list(self.policy.names().values())
         writable = [self.policy.names()[f["id"]] for f in self.policy.folders if f["writable"]]
         return {
@@ -616,7 +565,6 @@ class Host:
         return self._local_view(local, reason)
 
     def _local_view(self, local: SiteLocalServer, reason: str | None) -> dict[str, Any]:
-        assert self.policy is not None
         enabled = bool(self.policy.enabled.get(local.id))
         problem = reason or self.local.problem(local)
         if not problem and not enabled:
@@ -632,23 +580,18 @@ class Host:
             "tools": [tool_view(t) for t in self.local.known_tools(local)] if enabled else [],
         }
 
-    def report(self) -> dict[str, Any]:
+    def summary(self) -> dict[str, Any] | None:
+        """What this site holds (`SiteSummary`), for its next poll; None
+        before it has joined."""
+        owner = self.identity.owner()
+        if owner is None:
+            return None
         reason = self.settings.unavailable()
-        value: dict[str, Any] = {
-            "protocol": PROTOCOL,
-            "version": version()[:64],
-            "mode": self.settings.mode,
-            "ready": reason is None,
-            "reason": reason,
-            "site": None,
-        }
-        if self.policy is None:
-            return value
         self._refresh_stale()
         servers = [self._files_view(reason)] if self.policy.folders else []
         servers += [self._local_view(local, reason) for local in self.local.entries.values()]
-        value["site"] = {
-            "owner": self.settings.owner,
+        return {
+            "owner": owner,
             "ownerInDevMode": self.policy.owner_in_dev_mode,
             "folders": [self._folder_view(f) for f in self.policy.folders],
             "servers": servers,
@@ -657,11 +600,9 @@ class Host:
                 for e in self.policy.access
             ],
         }
-        return value
 
     def _refresh_stale(self) -> None:
         """Keep an enabled server's tool list current without blocking a report."""
-        assert self.policy is not None
         for local in self.local.entries.values():
             if not self.policy.enabled.get(local.id) or local.id in self._refreshing:
                 continue

@@ -158,7 +158,7 @@ async def test_a_duplicate_name_from_before_reads_name_2(tmp_path: Path, folder:
     assert listed(await site.mcp(BO, FILES, "tools/list"))["read_text"] == ["Notes", "Notes (2)"]
     got = await site.mcp(BO, FILES, "tools/call", read("Notes (2)"))
     assert got["status"] == "done" and "the second" in text(got)
-    names = [f["name"] for f in site.host.report()["site"]["folders"]]
+    names = [f["name"] for f in site.host.summary()["folders"]]
     assert names == ["Notes", "Notes (2)"]
 
 
@@ -289,16 +289,15 @@ async def test_a_machine_without_its_own_account_runs_nothing(tmp_path: Path, fo
     site = Site(Host(settings_for(tmp_path, account_kind=None)))
     refused = await site.manage(ADA, "folder.add", name="Notes", path=str(folder))
     assert refused["status"] == "failed" and "Windows service" in refused["message"]
-    assert site.host.report()["ready"] is False
+    assert site.host.settings.unavailable() is not None
 
 
 async def test_the_report_is_the_sites_own_list(site: Site, folder: Path) -> None:
-    assert site.host.report()["site"]["servers"] == []
+    assert site.host.summary()["servers"] == []  # type: ignore[index]
     notes = await add(site, folder)
     await give(site, notes, (BO, False))
-    report = site.host.report()
-    assert report["protocol"] == "mcp-2026-07-28" and report["mode"] == "site"
-    summary = report["site"]
+    summary = site.host.summary()
+    assert summary is not None
     assert summary["owner"] == ADA and summary["ownerInDevMode"] is False
     assert summary["folders"] == [
         {

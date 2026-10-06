@@ -11,6 +11,7 @@ import pytest
 
 from eugene_plexus_site_host._generated.models import SiteCall, SiteLocalServer, SiteManage
 from eugene_plexus_site_host.host import Host
+from eugene_plexus_site_host.identity import Enrollment, Identity
 from eugene_plexus_site_host.settings import Settings
 
 ADA = "person-ada"
@@ -101,15 +102,34 @@ class Site:
         )
 
 
-def settings_for(tmp_path: Path, **overrides: Any) -> Settings:
+ENROLLMENT = Enrollment(
+    site="s-" + "a" * 26,
+    label="desk",
+    owner=ADA,
+    ownerName="ada",
+    url="http://127.0.0.1:9",
+    rootKey="",
+    enrolledAt="2026-10-06T12:00:00+00:00",
+)
+
+
+def joined(data: Path, enrollment: Enrollment = ENROLLMENT) -> Identity:
+    """A data directory holding a site's enrollment, as `join` leaves it."""
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+
+    identity = Identity(data)
+    identity.record(Ed25519PrivateKey.generate(), enrollment)
+    return identity
+
+
+def settings_for(tmp_path: Path, *, enrolled: bool = True, **overrides: Any) -> Settings:
     data = tmp_path / "data"
     data.mkdir(parents=True, exist_ok=True)
+    if enrolled and not (data / "site.json").exists():
+        joined(data)
     values: dict[str, Any] = {
         "data_dir": data,
         "port": 0,
-        "credential": "secret",
-        "mode": "site",
-        "owner": ADA,
         "account_kind": KIND,
         "protected": (data,),
     }

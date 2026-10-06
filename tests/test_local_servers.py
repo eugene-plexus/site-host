@@ -21,7 +21,7 @@ async def test_a_local_server_is_off_until_its_owner_turns_it_on(tmp_path: Path)
         BO, "fixture", "tools/call", {"name": "echo", "arguments": {"text": "hi"}}
     )
     assert refused["status"] == "failed" and "is off" in refused["message"]
-    view = next(s for s in site.host.report()["site"]["servers"] if s["id"] == "fixture")
+    view = next(s for s in site.host.summary()["servers"] if s["id"] == "fixture")
     assert view["enabled"] is False and view["tools"] == []
 
 
@@ -83,7 +83,7 @@ async def test_a_system_server_needs_an_administrators_consent(tmp_path: Path) -
     site = site_with(tmp_path, system=True)
     refused = await site.manage(ADA, "server.enable", server="fixture", enabled=True)
     assert refused["status"] == "failed" and "no administrator has consented" in refused["message"]
-    view = next(s for s in site.host.report()["site"]["servers"] if s["id"] == "fixture")
+    view = next(s for s in site.host.summary()["servers"] if s["id"] == "fixture")
     assert view["system"] is True and view["available"] is False
 
     consented = site_with(tmp_path / "again", system=True, consented=True)

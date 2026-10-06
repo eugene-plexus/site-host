@@ -12,30 +12,20 @@ import pytest
 
 from eugene_plexus_site_host.host import Host
 
-from .conftest import BO, Site, settings_for
+from .conftest import ADA, BO, Site, settings_for
 
 FILES = "files"
 
 
 async def granted(tmp_path: Path, root: Path, *, protected: tuple[Path, ...] = ()) -> Any:
-    site = Site(
-        Host(
-            settings_for(
-                tmp_path, mode="node", owner=None, protected=(tmp_path / "data", *protected)
-            )
-        )
-    )
-    found = await site.manage("operator", "folder.inspect", path=str(root))
+    site = Site(Host(settings_for(tmp_path, protected=(tmp_path / "data", *protected))))
+    found = await site.manage(ADA, "folder.add", name="Shared", path=str(root), writable=True)
     assert found["status"] == "done", found
-    grants = [
-        {
-            "folderId": "1",
-            "name": "Shared",
-            "path": found["result"]["path"],
-            "identity": found["result"]["identity"],
-            "writable": True,
-        }
-    ]
+    given = await site.manage(
+        ADA, "folder.people", id=found["result"]["id"], people=[{"subject": BO, "writable": True}]
+    )
+    assert given["status"] == "done", given
+    grants: list[dict[str, Any]] = []
 
     async def call(tool: str, **arguments: Any) -> dict[str, Any]:
         answer = await site.mcp(
@@ -108,10 +98,8 @@ async def test_a_protected_root_and_hard_links_are_refused(tmp_path: Path) -> No
     secret = tmp_path / "private"
     secret.mkdir()
     (secret / "node.yaml").write_text("secret", encoding="utf-8")
-    site = Site(
-        Host(settings_for(tmp_path, mode="node", owner=None, protected=(tmp_path / "data", secret)))
-    )
-    around = await site.manage("operator", "folder.inspect", path=str(tmp_path))
+    site = Site(Host(settings_for(tmp_path, protected=(tmp_path / "data", secret))))
+    around = await site.manage(ADA, "folder.add", name="Around", path=str(tmp_path))
     assert around["status"] == "failed", around
     shared = tmp_path / "shared"
     shared.mkdir()
