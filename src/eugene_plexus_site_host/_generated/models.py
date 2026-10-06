@@ -398,6 +398,12 @@ class SiteFolder(BaseModel):
         min_length=1,
     )
     path: str = Field(..., max_length=4096, min_length=1)
+    identity: str = Field(
+        ...,
+        description="The folder's identity on its file system, as the site recorded it. A dev-mode grant names it (`SiteGrantHint`).",
+        max_length=256,
+        min_length=1,
+    )
     writable: bool = Field(
         ...,
         description="Whether anyone may change files in it at all. A person's `writable` cannot exceed it.",

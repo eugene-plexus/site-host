@@ -297,6 +297,7 @@ async def test_the_report_is_the_sites_own_list(site: Site, folder: Path) -> Non
             "id": notes,
             "name": "Notes",
             "path": str(folder),
+            "identity": site.host.policy.folder(notes)["identity"],  # type: ignore[union-attr]
             "writable": False,
             "people": [{"subject": BO, "writable": False}],
         }

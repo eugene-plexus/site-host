@@ -581,6 +581,7 @@ class Host:
             "id": folder["id"],
             "name": self.policy.names()[folder["id"]],
             "path": folder["path"],
+            "identity": folder["identity"],
             "writable": folder["writable"],
             "people": [
                 {"subject": p["subject"], "writable": p["writable"]} for p in folder["people"]
