@@ -244,7 +244,9 @@ async def test_the_pipe_is_owned_by_the_site_host_and_grants_clients_only_data_r
     # The owner is named, so a client can tell who made the pipe it opened.
     assert text.startswith(f"O:{me}D:P(")
     aces = text.split("D:P", 1)[1]
-    assert aces == f"(A;;GA;;;SY)(A;;GA;;;BA)(A;;GA;;;{me})(A;;0x{local_channel.CLIENT_ACCESS:x};;;AU)"
+    assert (
+        aces == f"(A;;GA;;;SY)(A;;GA;;;BA)(A;;GA;;;{me})(A;;0x{local_channel.CLIENT_ACCESS:x};;;AU)"
+    )
     # Clients read and write data and read the pipe's security, and can never make
     # another instance of it (FILE_CREATE_PIPE_INSTANCE, 0x4), nor hold a generic right.
     assert local_channel.CLIENT_ACCESS == 0x00120083

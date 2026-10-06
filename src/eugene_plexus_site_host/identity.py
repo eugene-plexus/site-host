@@ -65,7 +65,7 @@ class Enrollment:
         return self.url.startswith("https://")
 
 
-def public_b64(key: Ed25519PrivateKey | Ed25519PublicKey) -> str:
+def public_b64(key: Ed25519PrivateKey | Ed25519PublicKey) -> str:  # gitleaks:allow
     public = key.public_key() if isinstance(key, Ed25519PrivateKey) else key
     raw = public.public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw)
     return base64.b64encode(raw).decode("ascii")
@@ -84,7 +84,7 @@ class Identity:
     def __init__(self, data_dir: Path) -> None:
         self.data_dir = data_dir
         self._cached: tuple[float, Enrollment | None] | None = None
-        self._key: Ed25519PrivateKey | None = None
+        self._key: Ed25519PrivateKey | None = None  # gitleaks:allow
 
     @property
     def pins_path(self) -> Path:
