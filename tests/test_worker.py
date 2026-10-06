@@ -381,3 +381,81 @@ def test_the_real_account_is_the_one_the_system_reports() -> None:
         assert mine.startswith("S-1-5-")
     else:
         assert mine.isdigit()
+
+
+async def test_naming_servers_or_roots_in_a_call_changes_neither_list(tmp_path: Path) -> None:
+    """The site host's message can name no program and no protected root: both
+    are the worker's own."""
+    entry = local_server()
+    named = {
+        "kind": "local",
+        "server": "fixture",
+        "servers": [entry.model_dump(mode="json", by_alias=True)],
+    }
+    with pytest.raises(WorkerError, match="not on this machine's list"):
+        await bare(tmp_path).handle({"op": "mcp", "work": named, "request": rpc("tools/list")})
+    secret = tmp_path / "private"
+    secret.mkdir()
+    (secret / "node.yaml").write_text("secret", encoding="utf-8")
+    work = {**folder_work(secret), "protected": []}
+    refused = await bare(tmp_path, protected=[secret]).handle(
+        {"op": "mcp", "work": work, "request": listing()}
+    )
+    assert refused["response"]["result"]["isError"] is True
+
+
+async def test_a_worker_another_worker_replaced_stops_for_good(open_site: OpenSite) -> None:
+    site = await open_site()
+    assert site.task is not None
+    first = site.task
+    settings = site.host.settings
+    assert settings.channel is not None
+    second = Worker(
+        account=site.account,
+        channel=settings.channel,
+        host=site.account,
+        servers=(),
+        protected=[],
+        workspace=settings.data_dir,
+    )
+    replacing = asyncio.create_task(second.run())
+    try:
+        # It ends rather than reconnecting and trading the connection back.
+        await asyncio.wait_for(first, 10)
+    finally:
+        replacing.cancel()
+
+
+def test_the_command_line_hands_the_worker_what_it_was_started_with(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(accounts, "own", lambda: SID)
+    monkeypatch.setattr(accounts, "elevated", lambda: False)
+    made: list[dict[str, Any]] = []
+
+    class Capture:
+        def __init__(self, **kwargs: Any) -> None:
+            made.append(kwargs)
+
+        async def run(self) -> None:
+            return None
+
+    monkeypatch.setattr(worker, "Worker", Capture)
+    servers = tmp_path / "servers.yaml"
+    servers.write_text(
+        yaml.safe_dump(
+            {"servers": [{"id": "fixture", "name": "X", "command": "/bin/x", "sha256": "a" * 64}]}
+        ),
+        encoding="utf-8",
+    )
+    kept = tmp_path / "keep"
+    # The site host's own account is this worker's, and the starter says so.
+    worker.main(
+        [
+            "--account", SID, "--channel", "x", "--host", SID, "--shared-account",
+            "--servers", str(servers), "--protect", str(kept), "--workspace", str(tmp_path),
+        ]
+    )  # fmt: skip
+    assert len(made) == 1
+    assert [s.id for s in made[0]["servers"]] == ["fixture"]
+    assert kept in made[0]["protected"] and Path(worker.__file__).parent in made[0]["protected"]

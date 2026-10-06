@@ -140,6 +140,7 @@ async def test_a_call_that_is_not_answered_times_out_and_leaves_nothing_pending(
         await rig.workers.call(ME, {"op": "slow"}, 0.3)
     assert 0.25 < time.perf_counter() - started < 5
     heard = await asyncio.wait_for(conn.receive(), 5)
+    assert rig.workers._by_account[ME].pending == {}, "a timed-out call is forgotten"
     assert heard is not None and heard["op"] == "slow"
     # The worker is still connected, and a later call still works.
     serving = asyncio.create_task(answer_calls(conn))
@@ -221,3 +222,19 @@ async def test_a_taken_channel_name_is_said_in_the_problem(rig: Rig, tmp_path: P
     # The first still takes workers.
     await rig.worker()
     await until(lambda: rig.workers.connected(ME))
+
+
+async def test_only_a_result_answers_a_call(rig: Rig) -> None:
+    conn = await rig.worker()
+    await until(lambda: rig.workers.connected(ME))
+
+    async def impatient() -> None:
+        message = await conn.receive()
+        assert message is not None
+        # The right id, the wrong kind of message: not an answer.
+        await conn.send({"t": "progress", "id": message["id"], "ok": True})
+
+    serving = asyncio.create_task(impatient())
+    with pytest.raises(WorkerTimeout):
+        await rig.workers.call(ME, {"op": "x"}, 0.5)
+    await serving

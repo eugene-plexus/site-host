@@ -202,3 +202,111 @@ async def test_a_closed_connection_reads_as_gone_at_the_other_end(harness: Harne
     server_side = await harness.next()
     await client.close()
     assert await asyncio.wait_for(server_side.receive(), 10) is None
+
+
+# --- the pipe's own security (Windows) ---------------------------------------------------
+
+
+def _capture(monkeypatch: pytest.MonkeyPatch, name: str) -> list[tuple[Any, ...]]:
+    """Record every call to one of the module's Win32 entry points, then make it."""
+    real = getattr(local_channel, name)
+    calls: list[tuple[Any, ...]] = []
+
+    def spy(*args: Any) -> Any:
+        calls.append(args)
+        return real(*args)
+
+    monkeypatch.setattr(local_channel, name, spy)
+    return calls
+
+
+@pytest.mark.skipif(not WINDOWS, reason="a pipe's security descriptor is Windows's")
+async def test_the_pipe_is_owned_by_the_site_host_and_grants_clients_only_data_rights(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sddl = _capture(monkeypatch, "_ConvertSddl")
+    created = _capture(monkeypatch, "_CreateNamedPipeW")
+    opened = _capture(monkeypatch, "_CreateFileW")
+    me = local_channel.own_account()
+    channel = new_channel()
+
+    async def accept(_conn: Connection) -> None:
+        return None
+
+    server = await local_channel.serve(channel, me, accept)
+    try:
+        client = await local_channel.connect(channel, me, {})
+        await client.close()
+    finally:
+        await server.close()
+        drop_channel(channel)
+    text = sddl[0][0]
+    # The owner is named, so a client can tell who made the pipe it opened.
+    assert text.startswith(f"O:{me}D:P(")
+    aces = text.split("D:P", 1)[1]
+    assert aces == f"(A;;GA;;;SY)(A;;GA;;;BA)(A;;GA;;;{me})(A;;0x{local_channel.CLIENT_ACCESS:x};;;AU)"
+    # Clients read and write data and read the pipe's security, and can never make
+    # another instance of it (FILE_CREATE_PIPE_INSTANCE, 0x4), nor hold a generic right.
+    assert local_channel.CLIENT_ACCESS == 0x00120083
+    assert not local_channel.CLIENT_ACCESS & 0x4
+    assert not local_channel.CLIENT_ACCESS & 0xF0000000
+    # Only the machine's own clients: the first instance is exclusive, none is remote.
+    assert created and all(call[2] & local_channel.PIPE_REJECT_REMOTE_CLIENTS for call in created)
+    assert created[0][1] & local_channel.FILE_FLAG_FIRST_PIPE_INSTANCE
+    assert not any(call[1] & local_channel.FILE_FLAG_FIRST_PIPE_INSTANCE for call in created[1:])
+    # A worker lets the site host learn who it is and never act as it.
+    flags = opened[0][5]
+    assert flags & local_channel.SECURITY_SQOS_PRESENT
+    assert flags & local_channel.SECURITY_IDENTIFICATION
+
+
+@pytest.mark.skipif(not WINDOWS, reason="the impersonation is Windows's")
+async def test_a_thread_that_cannot_revert_from_a_worker_ends_the_process(
+    harness: Harness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    exits: list[int] = []
+    real = local_channel._RevertToSelf
+
+    def failing() -> bool:
+        real()
+        return False
+
+    monkeypatch.setattr(local_channel, "_RevertToSelf", failing)
+    monkeypatch.setattr(local_channel.os, "_exit", exits.append)
+    client = await local_channel.connect(harness.channel, local_channel.own_account(), {})
+    await harness.next()
+    assert exits == [70]
+    await client.close()
+
+
+@pytest.mark.skipif(not WINDOWS, reason="the first frame is read from a raw pipe on Windows")
+async def test_a_first_frame_that_is_not_a_hello_is_not_served(harness: Harness) -> None:
+    pipe = local_channel._open_client(harness.channel, local_channel.own_account())
+    try:
+        await asyncio.to_thread(pipe.write_all, b'{"t":"call","id":"x"}\n')
+        await asyncio.sleep(0.5)
+        assert harness.accepted == []
+    finally:
+        pipe.close()
+
+
+@pytest.mark.skipif(not WINDOWS, reason="the first frame is read from a raw pipe on Windows")
+async def test_a_first_frame_over_the_limit_is_dropped_at_once(harness: Harness) -> None:
+    pipe = local_channel._open_client(harness.channel, local_channel.own_account())
+    try:
+        await asyncio.to_thread(pipe.write_all, b"x" * (MAX_FRAME + 10))
+        # The site host closes the pipe; waiting for a newline instead would
+        # hold it until the hello deadline.
+        answer = await asyncio.to_thread(pipe.read, 2000)
+        assert answer == b"" and harness.accepted == []
+    finally:
+        pipe.close()
+
+
+async def test_bytes_with_no_end_of_line_are_refused_at_the_limit(harness: Harness) -> None:
+    client = await local_channel.connect(harness.channel, local_channel.own_account(), {})
+    server_side = await harness.next()
+    await raw_send(client, b"x" * (MAX_FRAME + 10))
+    with pytest.raises(ChannelError, match="256 KiB"):
+        await asyncio.wait_for(server_side.receive(), 10)
+    await client.close()

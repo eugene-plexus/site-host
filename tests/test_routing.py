@@ -436,3 +436,16 @@ async def test_a_summary_with_no_links_file_says_no_links_and_no_link_page(
     summary = site.host.summary()
     assert summary is not None
     assert summary["links"] == [] and summary["linkPage"] is None
+
+
+async def test_the_summary_ends_the_connection_of_an_account_whose_link_was_removed(
+    open_site: OpenSite,
+) -> None:
+    site = await open_site()
+    assert site.host.workers.connected(ME)
+    relink(site)  # nobody is linked any more
+    assert site.host.summary() is not None
+    deadline = time.perf_counter() + 10
+    while site.host.workers.connected(ME):
+        assert time.perf_counter() < deadline, "the unlinked account's worker was never ended"
+        await asyncio.sleep(0.05)
