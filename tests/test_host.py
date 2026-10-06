@@ -9,6 +9,8 @@ import time
 from pathlib import Path
 from typing import Any
 
+import pytest
+
 from eugene_plexus_site_host.host import Host
 from eugene_plexus_site_host.policy import Policy
 
@@ -160,6 +162,18 @@ async def test_a_duplicate_name_from_before_reads_name_2(tmp_path: Path, folder:
     assert got["status"] == "done" and "the second" in text(got)
     names = [f["name"] for f in site.host.summary()["folders"]]
     assert names == ["Notes", "Notes (2)"]
+
+
+async def test_an_owner_named_in_the_environment_is_not_the_owner(
+    site: Site, folder: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Who owns the site is its enrollment's to say. Whatever the launch
+    environment names, only the person the join pinned manages it."""
+    monkeypatch.setenv("SITE_HOST_OWNER", BO)
+    monkeypatch.setenv("EUGENE_PLEXUS_SITE_OWNER", BO)
+    refused = await site.manage(BO, "folder.add", name="X", path=str(folder))
+    assert refused["status"] == "failed" and "Only this machine's owner" in refused["message"]
+    assert (await site.manage(ADA, "folder.add", name="X", path=str(folder)))["status"] == "done"
 
 
 async def test_editing_the_root_is_not_enough(site: Site, folder: Path) -> None:
