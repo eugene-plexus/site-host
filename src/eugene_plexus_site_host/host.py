@@ -210,6 +210,11 @@ class Host:
         return f"You have not been given {what}."
 
     def _may_call(self, target: Target, tool: Any, arguments: Any) -> None:
+        if target.folders is not None and tool == "write_text" and tool not in target.allowed:
+            raise Refused(
+                "You may read folders here but not change files in them. This machine's owner "
+                "can let you, from Workbench (Job sites)."
+            )
         if not isinstance(tool, str) or tool not in target.allowed:
             raise Refused(f"You may not use {tool!r} on {target.name}.")
         offered = target.tools.get(tool)

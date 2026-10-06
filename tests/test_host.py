@@ -106,6 +106,14 @@ async def test_changing_files_is_the_folders_standing_pre_approval(
     assert (other / "new.txt").read_text(encoding="utf-8") == "hi"
 
 
+async def test_a_reader_is_told_plainly_they_may_not_change_files(site: Site, folder: Path) -> None:
+    notes = await add(site, folder, writable=True)
+    await give(site, notes, (BO, False))
+    refused = await site.mcp(BO, FILES, "tools/call", write("Notes", "new.txt"))
+    assert refused["status"] == "failed" and "not change files" in refused["message"]
+    assert not (folder / "new.txt").exists()
+
+
 async def test_a_read_only_folder_takes_no_writer(site: Site, folder: Path) -> None:
     notes = await add(site, folder, writable=False)
     refused = await site.manage(
