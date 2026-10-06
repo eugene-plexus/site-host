@@ -262,8 +262,13 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--servers", help="the local-server list")
     parser.add_argument("--protect", action="append", default=[], help="never a folder")
     parser.add_argument("--workspace", help="where local servers keep their own files")
+    parser.add_argument(
+        "--shared-account",
+        action="store_true",
+        help="the site host runs as this same person (a per-user install, J38)",
+    )
     args = parser.parse_args(argv)
-    if why := accounts.refuse_to_serve(args.account, args.host):
+    if why := accounts.refuse_to_serve(args.account, args.host, shared=args.shared_account):
         sys.exit(f"eugene-plexus-site-worker: {why}")
     protected = [Path(sys.prefix), Path(__file__).parent, *(Path(p) for p in args.protect)]
     worker = Worker(

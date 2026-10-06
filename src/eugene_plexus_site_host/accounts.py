@@ -114,12 +114,17 @@ def own() -> str:
     return str(os.geteuid())
 
 
-def refuse_to_serve(expected: str, host: str | None) -> str | None:
-    """Why a worker started for `expected` must not serve, or None."""
+def refuse_to_serve(expected: str, host: str | None, *, shared: bool = False) -> str | None:
+    """Why a worker started for `expected` must not serve, or None.
+
+    `shared` is the per-user install's case (J38): there the site host runs
+    as the one person it serves, so their worker shares its account. The
+    starter says so; a service or system install never does, and there the
+    site host's own account is never a person's."""
     mine = own()
     if mine != expected:
         return f"This worker runs as {mine}, not the account it was started for ({expected})."
-    if host is not None and mine == host:
+    if host is not None and mine == host and not shared:
         return "This worker runs as the site host's own account, which is never a person's."
     if why := not_a_person(mine):
         return f"This worker runs as {why}, which is never a person's."

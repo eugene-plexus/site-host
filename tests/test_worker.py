@@ -331,6 +331,21 @@ def test_a_worker_never_serves_as_the_site_hosts_own_account(
     assert why is not None and "site host's own account" in why
 
 
+def test_a_per_user_worker_shares_the_site_hosts_account_when_its_starter_says_so(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A per-user install (J38): the site host runs as the one person it
+    # serves. Only the starter's explicit word makes that acceptable.
+    serving_as(monkeypatch, SID)
+    assert accounts.refuse_to_serve(SID, SID, shared=True) is None
+    # Saying so does not excuse anything else.
+    serving_as(monkeypatch, SID, elevated=True)
+    why = accounts.refuse_to_serve(SID, SID, shared=True)
+    assert why is not None and "elevated" in why
+    serving_as(monkeypatch, "S-1-5-18")
+    assert accounts.refuse_to_serve("S-1-5-18", "S-1-5-18", shared=True) is not None
+
+
 def test_an_elevated_worker_is_refused(monkeypatch: pytest.MonkeyPatch) -> None:
     serving_as(monkeypatch, SID, elevated=True)
     why = accounts.refuse_to_serve(SID, "S-1-5-21-1-2-3-1500")
