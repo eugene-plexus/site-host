@@ -10,15 +10,15 @@ from typing import Any
 
 import pytest
 
-from eugene_plexus_site_host.host import Host
-
-from .conftest import ADA, BO, Site, settings_for
+from .conftest import ADA, BO, OpenSite
 
 FILES = "files"
 
 
-async def granted(tmp_path: Path, root: Path, *, protected: tuple[Path, ...] = ()) -> Any:
-    site = Site(Host(settings_for(tmp_path, protected=(tmp_path / "data", *protected))))
+async def granted(
+    open_site: OpenSite, tmp_path: Path, root: Path, *, protected: tuple[Path, ...] = ()
+) -> Any:
+    site = await open_site(tmp_path, protected=(tmp_path / "data", *protected))
     found = await site.manage(ADA, "folder.add", name="Shared", path=str(root), writable=True)
     assert found["status"] == "done", found
     given = await site.manage(
@@ -48,11 +48,11 @@ def body(result: dict[str, Any]) -> dict[str, Any]:
     return value
 
 
-async def test_read_write_create_and_a_stale_edit(tmp_path: Path) -> None:
+async def test_read_write_create_and_a_stale_edit(tmp_path: Path, open_site: OpenSite) -> None:
     root = tmp_path / "shared"
     root.mkdir()
     (root / "note.txt").write_text("Original", encoding="utf-8")
-    _, _, call = await granted(tmp_path, root)
+    _, _, call = await granted(open_site, tmp_path, root)
     read = body(await call("read_text", path="note.txt"))
     assert read["text"] == "Original"
     body(await call("write_text", path="note.txt", text="Updated", expectedSha256=read["sha256"]))
@@ -66,11 +66,11 @@ async def test_read_write_create_and_a_stale_edit(tmp_path: Path) -> None:
 
 
 @pytest.mark.parametrize("bad", ["absolute", "traversal", "extra", "large"])
-async def test_the_scope_does_not_grow(tmp_path: Path, bad: str) -> None:
+async def test_the_scope_does_not_grow(tmp_path: Path, open_site: OpenSite, bad: str) -> None:
     root = tmp_path / "shared"
     root.mkdir()
     (root / "note.txt").write_text("Original", encoding="utf-8")
-    site, grants, _ = await granted(tmp_path, root)
+    site, grants, _ = await granted(open_site, tmp_path, root)
     arguments: dict[str, Any] = {
         "folder": "Shared",
         "path": "note.txt",
@@ -94,16 +94,18 @@ async def test_the_scope_does_not_grow(tmp_path: Path, bad: str) -> None:
     assert not (tmp_path / "escaped.txt").exists()
 
 
-async def test_a_protected_root_and_hard_links_are_refused(tmp_path: Path) -> None:
+async def test_a_protected_root_and_hard_links_are_refused(
+    tmp_path: Path, open_site: OpenSite
+) -> None:
     secret = tmp_path / "private"
     secret.mkdir()
     (secret / "node.yaml").write_text("secret", encoding="utf-8")
-    site = Site(Host(settings_for(tmp_path, protected=(tmp_path / "data", secret))))
+    site = await open_site(tmp_path, protected=(tmp_path / "data", secret))
     around = await site.manage(ADA, "folder.add", name="Around", path=str(tmp_path))
     assert around["status"] == "failed", around
     shared = tmp_path / "shared"
     shared.mkdir()
     os.link(secret / "node.yaml", shared / "note.txt")
-    _, _, call = await granted(tmp_path, shared, protected=(secret,))
+    _, _, call = await granted(open_site, tmp_path, shared, protected=(secret,))
     linked = await call("read_text", path="note.txt")
     assert linked["isError"] is True and "secret" not in json.dumps(linked)

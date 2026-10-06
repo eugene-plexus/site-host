@@ -30,6 +30,7 @@ def create_app(settings: Settings, *, channel: Channel | None = None) -> FastAPI
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
+        await host.start()
         task = asyncio.create_task(link.run())
         try:
             yield
@@ -37,6 +38,7 @@ def create_app(settings: Settings, *, channel: Channel | None = None) -> FastAPI
             task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await task
+            await host.stop()
 
     app = FastAPI(
         title="Eugene Plexus site host",
@@ -50,7 +52,7 @@ def create_app(settings: Settings, *, channel: Channel | None = None) -> FastAPI
 
     @app.get("/healthz")
     async def healthz() -> JSONResponse:
-        unavailable = settings.unavailable()
+        unavailable = host.reason()
         try:
             enrollment = identity.load()
         except IdentityError as exc:

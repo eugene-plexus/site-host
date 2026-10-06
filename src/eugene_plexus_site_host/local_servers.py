@@ -12,10 +12,10 @@ whether it is on at all, is the site owner's policy.
 administrator's consent, recorded at the machine with the program's hash
 (J9). No such server ships with Eugene; the gate exists for the first one.
 
-These programs run in the host's own account, as C5b's local servers run in
-Workbench's: trusted code the administrator chose, not sandboxes. Their
-standard error is discarded, because a program can print the credentials in
-its environment there.
+These programs run in the worker of whoever calls them, as that person, or
+as the site's owner for someone with no link (J27): trusted code the
+administrator chose, not sandboxes. Their standard error is discarded,
+because a program can print the credentials in its environment there.
 """
 
 from __future__ import annotations
@@ -94,9 +94,15 @@ class _Listing:
 
 
 class LocalServers:
-    def __init__(self, entries: tuple[SiteLocalServer, ...], data_dir: Path) -> None:
+    def __init__(
+        self, entries: tuple[SiteLocalServer, ...], data_dir: Path, *, verify: bool = True
+    ) -> None:
         self.entries = {e.id: e for e in entries}
         self.data_dir = data_dir
+        #: Whether `problem()` reads the program to check its hash. The site
+        #: host does not (it may not be able to read a program in a person's
+        #: own folders, and runs none); each worker does, before every run.
+        self.verify = verify
         self.active = 0
         self._hashes: dict[str, tuple[int, int, str]] = {}
         self._listings: dict[str, _Listing] = {}
@@ -111,6 +117,14 @@ class LocalServers:
             return f"{entry.name}: its program must be named by its full path."
         if os.name == "nt" and command.suffix.lower() != ".exe":
             return f"{entry.name}: on Windows its program must be an .exe."
+        if entry.system and entry.consentedAt is None:
+            return (
+                f"{entry.name} can change this machine's system, and no administrator has "
+                "consented at the machine. An administrator runs "
+                f"`eugene-plexus-agent site server add --system` there."
+            )
+        if not self.verify:
+            return None
         try:
             info = command.stat()
         except OSError:
@@ -126,12 +140,6 @@ class LocalServers:
             return (
                 f"{entry.name}: its program changed since an administrator added it. "
                 "Add it again at the machine to run the new one."
-            )
-        if entry.system and entry.consentedAt is None:
-            return (
-                f"{entry.name} can change this machine's system, and no administrator has "
-                "consented at the machine. An administrator runs "
-                f"`eugene-plexus-agent site server add --system` there."
             )
         return None
 
@@ -200,6 +208,12 @@ class LocalServers:
 
     def forget(self, server_id: str) -> None:
         self._listings.pop(server_id, None)
+
+    def remember(self, server_id: str, tools: list[types.Tool]) -> None:
+        """A tool list a worker reported, kept as if listed here."""
+        if len(tools) > MAX_TOOLS:
+            raise LocalServerError(f"{server_id} offers more than {MAX_TOOLS} tools.")
+        self._listings[server_id] = _Listing(time.perf_counter(), list(tools))
 
     def server(self, entry: SiteLocalServer, outcome: Outcome) -> Server:
         """An in-process MCP server that forwards to the program, for one request."""

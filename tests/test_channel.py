@@ -39,6 +39,11 @@ class FakeRoot:
         self.left = False
         self.reports: list[dict[str, Any]] = []
         self.enroll_answer: tuple[int, dict[str, Any]] | None = None
+        self.person_answer: tuple[int, dict[str, Any]] = (
+            200,
+            {"subject": "person-jo", "name": "jo"},
+        )
+        self.person_checks: list[dict[str, Any]] = []
 
     def check(self, request: httpx.Request) -> None:
         token = request.headers["authorization"].removeprefix("Bearer ")
@@ -80,6 +85,9 @@ class FakeRoot:
         if path.endswith("/result"):
             self.results[path.split("/")[-2]] = json.loads(request.content)
             return httpx.Response(204)
+        if path == "/v1/sites/links/check":
+            self.person_checks.append(json.loads(request.content))
+            return httpx.Response(self.person_answer[0], json=self.person_answer[1])
         if path == "/v1/sites/leave":
             self.left = True
             return httpx.Response(204)
@@ -276,3 +284,52 @@ async def test_leaving_tells_the_root_and_forgets_the_enrollment(
     await link.leave()
     assert root.left is True
     assert identity.load() is None and not (identity.data_dir / "site_key.pem").exists()
+
+
+async def test_check_person_asks_the_root_with_the_sites_token_and_returns_who(
+    tmp_path: Path, root: FakeRoot
+) -> None:
+    _, link = await joined_site(tmp_path, root)
+    # `FakeRoot.check` verifies the EdDSA token against the site's public key.
+    who = await link.check_person("jo", "hunter2")
+    assert who == {"subject": "person-jo", "name": "jo"}
+    assert root.person_checks == [{"name": "jo", "password": "hunter2"}]
+
+
+async def test_check_person_names_the_name_typed_when_the_root_gives_none(
+    tmp_path: Path, root: FakeRoot
+) -> None:
+    _, link = await joined_site(tmp_path, root)
+    root.person_answer = (200, {"subject": "person-jo"})
+    assert await link.check_person("Jo", "pw") == {"subject": "person-jo", "name": "Jo"}
+
+
+@pytest.mark.parametrize(
+    ("status", "words"),
+    [
+        (401, "name or password is not right"),
+        (403, "turned off, or is not a person on a site"),
+        (429, "Too many tries"),
+        (500, r"could not check it \(500\)"),
+        (200, "answer could not be read"),
+    ],
+)
+async def test_check_person_says_what_the_root_said_no_to(
+    tmp_path: Path, root: FakeRoot, status: int, words: str
+) -> None:
+    _, link = await joined_site(tmp_path, root)
+    root.person_answer = (status, {"detail": {"detail": "x"}})
+    with pytest.raises(PermissionError, match=words):
+        await link.check_person("jo", "pw")
+    assert root.person_checks, "the root was asked"
+
+
+async def test_check_person_on_a_machine_that_has_not_joined_asks_nobody(
+    tmp_path: Path, root: FakeRoot
+) -> None:
+    settings = settings_for(tmp_path, enrolled=False)
+    identity = Identity(settings.data_dir)
+    link = Channel(Host(settings, identity), identity, settings)
+    with pytest.raises(PermissionError, match="not a job site"):
+        await link.check_person("jo", "pw")
+    assert root.person_checks == []

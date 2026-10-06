@@ -1,18 +1,26 @@
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import hashlib
+import json
 import secrets
+import shutil
 import sys
+import tempfile
 import time
+from collections.abc import AsyncIterator, Awaitable, Callable
 from pathlib import Path
 from typing import Any
 
 import pytest
 
+from eugene_plexus_site_host import local_channel
 from eugene_plexus_site_host._generated.models import SiteCall, SiteLocalServer, SiteManage
 from eugene_plexus_site_host.host import Host
 from eugene_plexus_site_host.identity import Enrollment, Identity
 from eugene_plexus_site_host.settings import Settings
+from eugene_plexus_site_host.worker import Worker
 
 ADA = "person-ada"
 BO = "person-bo"
@@ -56,11 +64,92 @@ def local_server(
     )
 
 
+def new_channel() -> str:
+    """A channel name no other test (or program) holds: a pipe name on
+    Windows, a socket path in a short directory elsewhere (`AF_UNIX` paths
+    are short)."""
+    if sys.platform == "win32":
+        return "\\\\.\\pipe\\eugene-plexus-site-test-" + secrets.token_hex(8)
+    return str(Path(tempfile.mkdtemp(prefix="eps")) / "channel")
+
+
+def drop_channel(channel: str) -> None:
+    if sys.platform != "win32":
+        shutil.rmtree(Path(channel).parent, ignore_errors=True)
+
+
+def link_entry(subject: str, account: str, name: str = "person") -> dict[str, str]:
+    return {
+        "subject": subject,
+        "name": name,
+        "account": account,
+        "accountName": "HOST/" + name,
+        "linkedAt": "2026-10-06T12:00:00Z",
+    }
+
+
+def write_links(path: Path, *entries: dict[str, str]) -> None:
+    path.write_text(json.dumps({"version": 1, "links": list(entries)}), encoding="utf-8")
+
+
+#: An account no worker of these tests ever holds: a SID shape on Windows, a
+#: uid on POSIX.
+OTHER_ACCOUNT = "S-1-5-21-1-2-3-1001" if sys.platform == "win32" else "1001"
+
+
 class Site:
-    """A host and the calls the agent would relay to it."""
+    """A real site host and the calls the agent would relay to it, with a real
+    worker (in this process, as this process's own account) joined to it over
+    a real channel. Eugene's owner `ADA` is linked to that account; anyone
+    else is served by the owner's worker (J27)."""
 
     def __init__(self, host: Host) -> None:
         self.host = host
+        self.worker: Worker | None = None
+        self.task: asyncio.Task[None] | None = None
+        self.closed = False
+
+    @property
+    def account(self) -> str:
+        return local_channel.own_account()
+
+    async def start_worker(self, **own: Any) -> None:
+        """Connect a worker. `own` replaces what it is given of its own
+        (`servers`, `protected`): a worker reads its own list and keeps its own
+        protected roots, which need not be the site host's."""
+        settings = self.host.settings
+        assert settings.channel is not None
+        values: dict[str, Any] = {
+            "account": self.account,
+            "channel": settings.channel,
+            "host": self.account,
+            "servers": settings.local_servers,
+            "protected": list(settings.protected),
+            "workspace": settings.data_dir,
+            **own,
+        }
+        self.worker = Worker(**values)
+        self.task = asyncio.create_task(self.worker.run())
+        await self.until_connected()
+
+    async def until_connected(self, seconds: float = 15.0) -> None:
+        deadline = time.perf_counter() + seconds
+        while not self.host.workers.connected(self.account):
+            if time.perf_counter() > deadline:
+                raise AssertionError("the worker never connected to the site host")
+            await asyncio.sleep(0.02)
+
+    async def close(self) -> None:
+        if self.closed:
+            return
+        self.closed = True
+        if self.task is not None:
+            self.task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await self.task
+        await self.host.stop()
+        if self.host.settings.channel:
+            drop_channel(self.host.settings.channel)
 
     async def mcp(
         self,
@@ -132,6 +221,8 @@ def settings_for(tmp_path: Path, *, enrolled: bool = True, **overrides: Any) -> 
         "port": 0,
         "account_kind": KIND,
         "protected": (data,),
+        "links_file": tmp_path / "links.json",
+        "channel": new_channel(),
     }
     values.update(overrides)
     return Settings(**values)
@@ -145,6 +236,34 @@ def folder(tmp_path: Path) -> Path:
     return shared
 
 
+OpenSite = Callable[..., Awaitable[Site]]
+
+
 @pytest.fixture
-def site(tmp_path: Path) -> Site:
-    return Site(Host(settings_for(tmp_path)))
+async def open_site(tmp_path: Path) -> AsyncIterator[OpenSite]:
+    """`await open_site(path, **settings)`: a started host with its owner
+    linked to this process's account and that account's worker connected."""
+    opened: list[Site] = []
+
+    async def make(path: Path | None = None, *, worker: bool = True, **overrides: Any) -> Site:
+        where = path or tmp_path
+        settings = settings_for(where, **overrides)
+        assert settings.links_file is not None
+        if not settings.links_file.exists():
+            write_links(settings.links_file, link_entry(ADA, local_channel.own_account(), "ada"))
+        made = Site(Host(settings))
+        opened.append(made)
+        await made.host.start()
+        assert made.host.workers.problem is None, made.host.workers.problem
+        if worker:
+            await made.start_worker()
+        return made
+
+    yield make
+    for made in reversed(opened):
+        await made.close()
+
+
+@pytest.fixture
+async def site(open_site: OpenSite) -> Site:
+    return await open_site()

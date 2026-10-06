@@ -6,17 +6,17 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from eugene_plexus_site_host.host import Host
-
-from .conftest import ADA, BO, Site, local_server, settings_for
+from .conftest import ADA, BO, OpenSite, Site, local_server
 
 
-def site_with(tmp_path: Path, **server: object) -> Site:
-    return Site(Host(settings_for(tmp_path, local_servers=(local_server(**server),))))  # type: ignore[arg-type]
+async def site_with(open_site: OpenSite, tmp_path: Path, **server: object) -> Site:
+    return await open_site(tmp_path, local_servers=(local_server(**server),))  # type: ignore[arg-type]
 
 
-async def test_a_local_server_is_off_until_its_owner_turns_it_on(tmp_path: Path) -> None:
-    site = site_with(tmp_path)
+async def test_a_local_server_is_off_until_its_owner_turns_it_on(
+    tmp_path: Path, open_site: OpenSite
+) -> None:
+    site = await site_with(open_site, tmp_path)
     refused = await site.mcp(
         BO, "fixture", "tools/call", {"name": "echo", "arguments": {"text": "hi"}}
     )
@@ -26,9 +26,9 @@ async def test_a_local_server_is_off_until_its_owner_turns_it_on(tmp_path: Path)
 
 
 async def test_a_new_tool_arrives_with_its_server_and_runs_under_the_sites_policy(
-    tmp_path: Path,
+    tmp_path: Path, open_site: OpenSite
 ) -> None:
-    site = site_with(tmp_path)
+    site = await site_with(open_site, tmp_path)
     on = await site.manage(ADA, "server.enable", server="fixture", enabled=True)
     assert on["status"] == "done", on
     tools = {t["name"]: t for t in on["result"]["server"]["tools"]}
@@ -55,8 +55,10 @@ async def test_a_new_tool_arrives_with_its_server_and_runs_under_the_sites_polic
     assert [t["name"] for t in listed["response"]["result"]["tools"]] == ["echo"]
 
 
-async def test_turning_a_server_off_takes_back_what_it_granted(tmp_path: Path) -> None:
-    site = site_with(tmp_path)
+async def test_turning_a_server_off_takes_back_what_it_granted(
+    tmp_path: Path, open_site: OpenSite
+) -> None:
+    site = await site_with(open_site, tmp_path)
     await site.manage(ADA, "server.enable", server="fixture", enabled=True)
     await site.manage(
         ADA, "access.set", server="fixture", people=[{"subject": BO, "tools": [{"name": "echo"}]}]
@@ -69,8 +71,8 @@ async def test_turning_a_server_off_takes_back_what_it_granted(tmp_path: Path) -
     assert refused["status"] == "failed"
 
 
-async def test_a_program_that_changed_is_not_run(tmp_path: Path) -> None:
-    site = site_with(tmp_path, sha="0" * 64)
+async def test_a_program_that_changed_is_not_run(tmp_path: Path, open_site: OpenSite) -> None:
+    site = await site_with(open_site, tmp_path, sha="0" * 64)
     refused = await site.manage(ADA, "server.enable", server="fixture", enabled=True)
     assert (
         refused["status"] == "failed"
@@ -78,22 +80,26 @@ async def test_a_program_that_changed_is_not_run(tmp_path: Path) -> None:
     )
 
 
-async def test_a_system_server_needs_an_administrators_consent(tmp_path: Path) -> None:
+async def test_a_system_server_needs_an_administrators_consent(
+    tmp_path: Path, open_site: OpenSite
+) -> None:
     """J9: no consent recorded at the machine, no system tool, whatever the owner says."""
-    site = site_with(tmp_path, system=True)
+    site = await site_with(open_site, tmp_path, system=True)
     refused = await site.manage(ADA, "server.enable", server="fixture", enabled=True)
     assert refused["status"] == "failed" and "no administrator has consented" in refused["message"]
     view = next(s for s in site.host.summary()["servers"] if s["id"] == "fixture")
     assert view["system"] is True and view["available"] is False
 
-    consented = site_with(tmp_path / "again", system=True, consented=True)
+    consented = await site_with(open_site, tmp_path / "again", system=True, consented=True)
     assert (await consented.manage(ADA, "server.enable", server="fixture", enabled=True))[
         "status"
     ] == "done"
 
 
-async def test_eugenes_owner_never_reaches_a_local_server(tmp_path: Path) -> None:
-    site = site_with(tmp_path)
+async def test_eugenes_owner_never_reaches_a_local_server(
+    tmp_path: Path, open_site: OpenSite
+) -> None:
+    site = await site_with(open_site, tmp_path)
     await site.manage(ADA, "server.enable", server="fixture", enabled=True)
     await site.manage(ADA, "settings.set", ownerInDevMode=True)
     refused = await site.mcp("operator", "fixture", "tools/list", mode="dev")

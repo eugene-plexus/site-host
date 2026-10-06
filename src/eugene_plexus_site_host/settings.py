@@ -1,23 +1,24 @@
-"""What the agent tells the host when it starts it, and nothing else.
+"""What the starter tells the host when it starts it, and nothing else.
 
-Everything arrives in the launch environment the agent builds
-(`specs/openapi/site-host.yaml`): the host reads no configuration file of
-the agent's. Who the site is, which root it belongs to and who owns it are
-its own enrollment, in its data directory (`identity.py`), never the
-environment. One fact here is the agent's to state and never the host's to
-change:
+Everything arrives in the launch environment (`specs/openapi/site-host.yaml`):
+the host reads no configuration file of the agent's. Who the site is, which
+root it belongs to and who owns it are its own enrollment, in its data
+directory (`identity.py`), never the environment. Two files are named here
+that the host reads and can never write, because each lives in the install's
+administrator-only place (§3.2):
 
-- **The local servers**: written by a machine administrator, proven elevated,
-  into the install's protected configuration, which the host's own account
-  cannot write (§6.2). A server marked `system` carries that administrator's
-  consent (J9). The agent copies them to a file the host may read and not
-  write, and names its SHA-256 here; a file that differs is refused.
+- **the links** (`SITE_HOST_LINKS_FILE`): who is which OS account here. Only
+  the machine's privileged starter makes a link, at the machine.
+- **the local servers** (`SITE_HOST_LOCAL_SERVERS_FILE`): written by a machine
+  administrator, proven elevated (§6.2). A server marked `system` carries
+  that administrator's consent (J9). Each worker reads the same file itself,
+  so this host can never name a program for a worker to run.
+
+The host opens no one's files (§3.2): every tool runs in a person's worker.
 """
 
 from __future__ import annotations
 
-import hashlib
-import hmac
 import json
 import os
 import sys
@@ -25,13 +26,10 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 
+import yaml
 from pydantic import ValidationError
 
-from ._generated.models import SiteLocalServer
-
-#: The only accounts the file tools run under: a Windows service's or a
-#: Linux system unit's, each the host's own (C1).
-ISOLATED_ACCOUNTS = frozenset({"windows_service", "systemd"})
+from ._generated.models import SiteLocalServer, SiteLocalServerList
 
 
 class SettingsError(Exception):
@@ -45,35 +43,43 @@ class Settings:
     account_kind: str | None = None
     protected: tuple[Path, ...] = ()
     local_servers: tuple[SiteLocalServer, ...] = field(default_factory=tuple)
+    links_file: Path | None = None
+    channel: str | None = None
+    link_page: str | None = None
+    #: Whether anyone but the owner may be served. False on macOS, which has
+    #: no folder boundary yet (§2.6).
+    sharing: bool = sys.platform != "darwin"
 
     def unavailable(self) -> str | None:
         """Why tools cannot run here at all, or None."""
-        if self.account_kind not in ISOLATED_ACCOUNTS:
-            return (
-                "Tools on this machine need Eugene installed as a Windows service or a Linux "
-                "system service, so they run in an account of their own."
-            )
-        if sys.platform not in {"win32", "linux"}:
-            return "Tools on this machine are supported on Windows and Linux."
+        if sys.platform not in {"win32", "linux", "darwin"}:
+            return "Tools on this machine are supported on Windows, Linux and macOS."
+        if self.channel is None:
+            return "This site was started with no channel for its workers. Update Eugene here."
         return None
 
 
-def _local_servers_text(values: Mapping[str, str]) -> str:
-    """The local servers, as JSON. The agent writes them to a file this
-    account may read and not write, beside the host's install, and names
-    the file and its SHA-256 here: a list may be longer than one variable
-    holds, and the hash is what the agent says, not what the file says."""
-    name = values.get("SITE_HOST_LOCAL_SERVERS_FILE")
-    if not name:
-        return "[]"
-    expected = values.get("SITE_HOST_LOCAL_SERVERS_SHA256", "")
+def read_local_servers(path: Path | None) -> tuple[SiteLocalServer, ...]:
+    """The administrator's list (`SiteLocalServerList`), or none."""
+    if path is None:
+        return ()
     try:
-        data = Path(name).read_bytes()
-    except OSError as exc:
-        raise SettingsError(f"the local servers file could not be read: {exc.strerror}") from None
-    if not hmac.compare_digest(hashlib.sha256(data).hexdigest(), expected):
-        raise SettingsError("the local servers file is not the one the agent wrote")
-    return data.decode("utf-8")
+        raw = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    except FileNotFoundError:
+        return ()
+    except (OSError, yaml.YAMLError) as exc:
+        raise SettingsError(f"the local servers file could not be read: {exc}") from None
+    try:
+        servers = tuple(SiteLocalServerList.model_validate(raw).servers)
+    except ValidationError as exc:
+        raise SettingsError(
+            f"the local servers file is not valid: {exc.error_count()} errors"
+        ) from None
+    if len({s.id for s in servers}) != len(servers):
+        raise SettingsError("two local servers share an id")
+    if any(s.id.startswith("files") for s in servers):
+        raise SettingsError("a local server's id begins 'files', which is Eugene's file server")
+    return servers
 
 
 def from_environment(env: Mapping[str, str] | None = None) -> Settings:
@@ -82,17 +88,16 @@ def from_environment(env: Mapping[str, str] | None = None) -> Settings:
         data = Path(values["EUGENE_PLEXUS_APP_DATA_DIR"])
         port = int(values["EUGENE_PLEXUS_APP_BIND_PORT"])
     except (KeyError, ValueError) as exc:
-        raise SettingsError(f"the agent did not provide {exc}") from None
+        raise SettingsError(f"the starter did not provide {exc}") from None
     try:
         roots = json.loads(values.get("SITE_HOST_PROTECTED_ROOTS", "[]"))
-        raw_servers = json.loads(_local_servers_text(values))
-        servers = tuple(SiteLocalServer.model_validate(s) for s in raw_servers)
-    except (ValueError, ValidationError, TypeError) as exc:
-        raise SettingsError(f"the agent's lists could not be read: {type(exc).__name__}") from None
-    if len({s.id for s in servers}) != len(servers):
-        raise SettingsError("two local servers share an id")
-    if any(s.id.startswith("files") for s in servers):
-        raise SettingsError("a local server's id begins 'files', which is Eugene's file server")
+    except (ValueError, TypeError) as exc:
+        raise SettingsError(
+            f"the protected roots could not be read: {type(exc).__name__}"
+        ) from None
+    servers_file = values.get("SITE_HOST_LOCAL_SERVERS_FILE")
+    servers = read_local_servers(Path(servers_file) if servers_file else None)
+    links = values.get("SITE_HOST_LINKS_FILE")
     protected = (data, Path(sys.prefix), Path(__file__).parent, *(Path(p) for p in roots))
     return Settings(
         data_dir=data,
@@ -100,4 +105,7 @@ def from_environment(env: Mapping[str, str] | None = None) -> Settings:
         account_kind=values.get("EUGENE_PLEXUS_APP_ACCOUNT_KIND"),
         protected=protected,
         local_servers=servers,
+        links_file=Path(links) if links else None,
+        channel=values.get("SITE_HOST_CHANNEL") or None,
+        link_page=values.get("SITE_HOST_LINK_PAGE") or None,
     )

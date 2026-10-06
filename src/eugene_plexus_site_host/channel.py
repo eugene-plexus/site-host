@@ -60,7 +60,7 @@ class Channel:
         return self.link
 
     def report(self) -> dict[str, Any]:
-        reason = self.settings.unavailable()
+        reason = self.host.reason()
         return {
             "protocol": PROTOCOL,
             "hostVersion": version()[:64],
@@ -171,6 +171,36 @@ class Channel:
         finally:
             await self.aclose()
             self.identity.forget()
+
+    async def check_person(self, name: str, password: str) -> dict[str, Any]:
+        """Who a person is, from their Eugene sign-in typed at this machine
+        (J36), so root can link them here. Raises `PermissionError` with the
+        root's words when the root says no."""
+        enrollment = self.identity.load()
+        if enrollment is None:
+            raise PermissionError("This machine is not a job site.")
+        try:
+            link = await self._link(enrollment)
+            response = await link.request(
+                "POST",
+                "/v1/sites/links/check",
+                headers={"Authorization": "Bearer " + self.identity.token(enrollment)},
+                json={"name": name, "password": password},
+            )
+        finally:
+            await self.aclose()
+        if response.status_code == 401:
+            raise PermissionError("That name or password is not right.")
+        if response.status_code == 403:
+            raise PermissionError("That person is turned off, or is not a person on a site.")
+        if response.status_code == 429:
+            raise PermissionError("Too many tries. Wait a minute and try again.")
+        if response.status_code != 200:
+            raise PermissionError(f"The root could not check it ({response.status_code}).")
+        answer = response.json()
+        if not isinstance(answer.get("subject"), str):
+            raise PermissionError("The root's answer could not be read.")
+        return {"subject": answer["subject"], "name": str(answer.get("name") or name)}
 
     async def run(self) -> None:
         try:

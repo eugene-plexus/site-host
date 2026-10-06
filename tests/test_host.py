@@ -14,7 +14,7 @@ import pytest
 from eugene_plexus_site_host.host import Host
 from eugene_plexus_site_host.policy import Policy
 
-from .conftest import ADA, BO, Site, rpc, settings_for
+from .conftest import ADA, BO, OpenSite, Site, rpc, settings_for
 
 FILES = "files"
 
@@ -144,17 +144,20 @@ async def test_a_folder_name_is_unique_on_the_machine(
     assert again["status"] == "failed" and "registered already" in again["message"]
 
 
-async def test_a_duplicate_name_from_before_reads_name_2(tmp_path: Path, folder: Path) -> None:
+async def test_a_duplicate_name_from_before_reads_name_2(
+    tmp_path: Path, folder: Path, open_site: OpenSite
+) -> None:
     other = tmp_path / "other"
     other.mkdir()
     (other / "note.txt").write_text("the second", encoding="utf-8")
-    first = Site(Host(settings_for(tmp_path)))
+    first = await open_site(tmp_path)
     one = await add(first, folder)
     two = await add(first, other, name="Elsewhere")
+    await first.close()
     policy = Policy.load(tmp_path / "data" / "policy.json")
     policy.folders[1]["name"] = "Notes"
     policy.save()
-    site = Site(Host(settings_for(tmp_path)))
+    site = await open_site(tmp_path)
     await give(site, one, (BO, False))
     await give(site, two, (BO, False))
     assert listed(await site.mcp(BO, FILES, "tools/list"))["read_text"] == ["Notes", "Notes (2)"]
@@ -196,12 +199,13 @@ async def test_editing_the_root_is_not_enough(site: Site, folder: Path) -> None:
 
 
 async def test_the_list_survives_a_restart_and_is_the_sites_own_file(
-    tmp_path: Path, folder: Path
+    tmp_path: Path, folder: Path, open_site: OpenSite
 ) -> None:
-    first = Site(Host(settings_for(tmp_path)))
+    first = await open_site(tmp_path)
     notes = await add(first, folder)
     await give(first, notes, (BO, False))
-    again = Site(Host(settings_for(tmp_path)))
+    await first.close()
+    again = await open_site(tmp_path)
     assert (await again.mcp(BO, FILES, "tools/call", read()))["status"] == "done"
     policy = Policy.load(tmp_path / "data" / "policy.json")
     assert [(f["name"], w) for f, w in policy.folders_for(BO)] == [("Notes", False)]
@@ -299,11 +303,18 @@ async def test_a_write_whose_end_is_unknown_is_uncertain(
     assert answer["status"] == "uncertain" and "did not finish" in answer["message"]
 
 
-async def test_a_machine_without_its_own_account_runs_nothing(tmp_path: Path, folder: Path) -> None:
-    site = Site(Host(settings_for(tmp_path, account_kind=None)))
+async def test_a_site_with_no_channel_for_its_workers_runs_nothing(
+    tmp_path: Path, folder: Path
+) -> None:
+    """2b.2: what makes a machine unable to run tools is no way to reach a
+    worker, not the lack of an isolated account (which retired)."""
+    host = Host(settings_for(tmp_path, channel=None))
+    await host.start()
+    site = Site(host)
     refused = await site.manage(ADA, "folder.add", name="Notes", path=str(folder))
-    assert refused["status"] == "failed" and "Windows service" in refused["message"]
-    assert site.host.settings.unavailable() is not None
+    assert refused["status"] == "failed" and "no channel for its workers" in refused["message"]
+    assert host.settings.unavailable() is not None and host.workers.problem is not None
+    assert host.reason() is not None
 
 
 async def test_the_report_is_the_sites_own_list(site: Site, folder: Path) -> None:
@@ -355,15 +366,16 @@ async def test_the_file_server_itself_refuses_a_folder_it_was_not_given(
 
 
 async def test_an_edited_policy_file_cannot_make_a_read_only_folder_writable(
-    tmp_path: Path, folder: Path
+    tmp_path: Path, folder: Path, open_site: OpenSite
 ) -> None:
-    first = Site(Host(settings_for(tmp_path)))
+    first = await open_site(tmp_path)
     notes = await add(first, folder, writable=False)
     await give(first, notes, (BO, False))
     policy = Policy.load(tmp_path / "data" / "policy.json")
     policy.folders[0]["people"][0]["writable"] = True
     policy.save()
-    site = Site(Host(settings_for(tmp_path)))
+    await first.close()
+    site = await open_site(tmp_path)
     assert "write_text" not in listed(await site.mcp(BO, FILES, "tools/list"))
     refused = await site.mcp(BO, FILES, "tools/call", write("Notes", "x.txt"))
     assert refused["status"] == "failed" and not (folder / "x.txt").exists()

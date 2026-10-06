@@ -5,6 +5,8 @@
 - `join`: make this machine a Job Site (`join.py`). Run at the machine, with
   the owner's password as the first line of standard input.
 - `leave`: tell the root this site is leaving, and forget its enrollment.
+- `check-person`: who a person is, from their Eugene sign-in typed at the
+  machine (J36), for root to link them on a Linux system install.
 
 `--data-dir` defaults to `EUGENE_PLEXUS_APP_DATA_DIR`, the directory the
 agent gave this app.
@@ -15,6 +17,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import getpass
+import json
 import os
 import sys
 from pathlib import Path
@@ -90,9 +93,29 @@ def _leave(args: argparse.Namespace) -> None:
     print("This machine is no longer a job site.")
 
 
+def _check_person(args: argparse.Namespace) -> None:
+    """Root links someone on a Linux system install (J36): who they are,
+    from their Eugene sign-in, as JSON on standard output."""
+    data = _data_dir(args.data_dir)
+    identity = Identity(data)
+    password = _password()
+    if not password:
+        sys.exit("eugene-plexus-site-host: the person's password is needed")
+    settings = Settings(data_dir=data, port=0)
+    channel = Channel(Host(settings, identity), identity, settings)
+    try:
+        person = asyncio.run(channel.check_person(args.name, password))
+    except PermissionError as exc:
+        sys.exit(f"eugene-plexus-site-host: {exc}")
+    print(json.dumps(person))
+
+
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(prog="eugene-plexus-site-host")
     commands = parser.add_subparsers(dest="command")
+    checking = commands.add_parser("check-person", help="who a person is, from their sign-in")
+    checking.add_argument("--name", required=True, help="how the person signs in")
+    checking.add_argument("--data-dir", dest="data_dir")
     commands.add_parser("serve", help="run the site (the default)")
     joining = commands.add_parser("join", help="make this machine a job site")
     joining.add_argument("--url", required=True, help="the root's address")
@@ -104,7 +127,9 @@ def main(argv: list[str] | None = None) -> None:
     leaving = commands.add_parser("leave", help="leave the install")
     leaving.add_argument("--data-dir", dest="data_dir")
     args = parser.parse_args(argv)
-    if args.command == "join":
+    if args.command == "check-person":
+        _check_person(args)
+    elif args.command == "join":
         _join(args)
     elif args.command == "leave":
         _leave(args)
