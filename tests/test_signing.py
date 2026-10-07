@@ -468,7 +468,13 @@ def test_the_approval_api_answers_its_token_only(tmp_path: Path) -> None:
         assert client.get("/v1/held", params={"subject": BO}, headers=auth).status_code == 404
         listed = client.get("/v1/held", params={"subject": ADA, "key": key.id}, headers=auth)
         assert listed.status_code == 200
-        assert listed.json() == {"subject": ADA, "keys": [key.id], "state": "signed", "items": []}
+        assert listed.json() == {
+            "subject": ADA,
+            "keys": [key.id],
+            "passkeys": [],
+            "state": "signed",
+            "items": [],
+        }
         assert listed.headers["cache-control"] == "no-store"
         assert (
             client.post("/v1/held/nothing/reject", json={"subject": ADA}, headers=auth).status_code

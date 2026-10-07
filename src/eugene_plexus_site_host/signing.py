@@ -177,6 +177,35 @@ def check(
     message = text.encode("utf-8")
     if not verify(found, message, signature):
         raise NotSigned("The signature does not match this change and this key.")
+    seq = check_envelope(
+        text,
+        site=site,
+        enrolled_at=enrolled_at,
+        person=person,
+        act=act,
+        args=args,
+        key=key,
+        last_seq=last_seq,
+        now=now,
+    )
+    return Checked(found, seq)
+
+
+def check_envelope(
+    text: str,
+    *,
+    site: str,
+    enrolled_at: str,
+    person: str,
+    act: str,
+    args: dict[str, Any],
+    key: str,
+    last_seq: int,
+    now: float | None = None,
+) -> int:
+    """The envelope's own checks, whichever kind of key signed it: canonical,
+    every field this change's and this enrollment's, the sequence newer than
+    the last approved, the time fresh. Its `seq`, or `NotSigned`."""
     try:
         value = json.loads(text)
     except ValueError:
@@ -206,7 +235,7 @@ def check(
     moment = time.time() if now is None else now
     if not moment - FRESH_SECONDS <= iat <= moment + AHEAD_SECONDS:
         raise NotSigned("This approval is too old. Open the page again.")
-    return Checked(found, seq)
+    return seq
 
 
 # --- what is kept ---------------------------------------------------------------

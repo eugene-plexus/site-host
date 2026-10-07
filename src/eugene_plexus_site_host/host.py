@@ -35,6 +35,12 @@ applied on the root's word: it is **held** until the owner approves it at the
 machine, on the starter's loopback page, which signs the envelope this host
 gives it (`signing.py`); this host checks that signature against the pinned
 key. A change that only takes access away is applied at once (J51).
+
+**A passkey from Workbench** (J14a.3, `passkeys.py`) is the owner's other
+kind of key: paired with a code this host makes and the starter shows at the
+machine, and used from Workbench, through the root, to list what is held and
+approve it. Its approval is checked as the loopback page's is, plus the
+WebAuthn assertion's own checks.
 """
 
 from __future__ import annotations
@@ -54,6 +60,7 @@ import mcp_types as types
 from pydantic import BaseModel, ValidationError
 
 from . import _build, accounts, dispatch, file_server, folder_io, signing
+from . import passkeys as pk
 from ._generated.models import (
     SiteAccessSet,
     SiteApproval,
@@ -63,8 +70,13 @@ from ._generated.models import (
     SiteFolderPeople,
     SiteFolderRemove,
     SiteGrantHint,
+    SiteHeldListRequest,
+    SiteHeldRejectRequest,
     SiteLocalServer,
     SiteManage,
+    SitePasskeyApproval,
+    SitePasskeyPair,
+    SitePasskeyRemove,
     SiteServerEnable,
     SiteSettings,
 )
@@ -95,9 +107,22 @@ class NotHeld(Exception):
     """No such person, key or held change here, for the starter's page."""
 
 
+_NOT_WAITING = "That is no longer waiting. Open the list again."
+_NO_SUCH_PASSKEY = "That passkey is not paired with this machine. Open the list again."
+_NO_PASSKEY = (
+    "That passkey is not one of yours on this machine any more. Pair it again with a code "
+    "from the machine."
+)
+
+
 #: The id of the one item that is not a held change: the site's rules as a
 #: whole, approved once the owner has a key (J52).
 RULES = "rules"
+#: The site actions that carry a passkey's work from Workbench (J14a.3):
+#: none of them is a change to what this machine allows.
+PASSKEY_ACTIONS = frozenset(
+    {"passkey.pair", "held.list", "held.approve", "held.reject", "passkey.remove"}
+)
 
 
 def is_destructive(tool: types.Tool) -> bool:
@@ -160,6 +185,8 @@ class Host:
         self.links = Links(settings.links_file)
         self.held = signing.HeldStore(settings.data_dir)
         self.sequence = signing.Sequence(settings.data_dir)
+        self.passkeys = pk.PasskeyStore(settings.data_dir)
+        self.codes = pk.Codes()
         self.workers = Workers(self.links, settings.channel, None)
         self.lock = asyncio.Lock()
         self.used: dict[str, float] = {}
@@ -497,7 +524,7 @@ class Host:
             "subject": action.subject,
             "kind": "manage",
             "action": name,
-            "arguments": None if name == "audit.read" else arguments,
+            "arguments": None if name == "audit.read" or name in PASSKEY_ACTIONS else arguments,
         }
         try:
             self._fresh(action.id, action.expiresAt)
@@ -507,11 +534,13 @@ class Host:
                     "Only this machine's owner changes what it allows. They do it from "
                     "Workbench (Job sites)."
                 )
+            if name in PASSKEY_ACTIONS:
+                return await self._passkey_action(name, owner, arguments)
             handler = self._handlers()[name]
             async with self.lock:
                 changes = name != "audit.read"
                 reduces = changes and self._reduces(name, arguments)
-                if changes and not reduces and self.keys_of(owner):
+                if changes and not reduces and self.has_key(owner):
                     message = self._hold(action, arguments)
                     self.audit.record(**entry, decision="allowed", outcome="held", reason=message)
                     return {"status": "held", "message": message}
@@ -732,9 +761,28 @@ class Host:
         link = self.links.for_subject(subject) if subject != OPERATOR else None
         return {key.id: key for key in link.keys} if link else {}
 
+    def passkeys_of(self, subject: str) -> list[pk.Passkey]:
+        """The passkeys paired under `subject`'s current link (J14a.3): one
+        paired under an earlier link, or for a person no longer linked,
+        approves nothing."""
+        link = self.links.for_subject(subject) if subject != OPERATOR else None
+        if link is None:
+            return []
+        return [
+            p
+            for p in self.passkeys.for_subject(subject)
+            if p.account == link.account and p.linked_at == link.linked_at
+        ]
+
+    def has_key(self, subject: str) -> bool:
+        """Whether `subject` has any key here that approves: one pinned at
+        the machine (Path A) or a passkey (Path B). Either makes a change
+        that gives access wait for it."""
+        return bool(self.keys_of(subject) or self.passkeys_of(subject))
+
     def signing_state(self) -> str:
         owner = self.identity.owner()
-        if owner is None or not self.keys_of(owner):
+        if owner is None or not self.has_key(owner):
             return "unsigned"
         return "signed" if self.policy.approved() else "unconfirmed"
 
@@ -913,7 +961,9 @@ class Host:
     def held_list(self, subject: str, key: str | None) -> dict[str, Any]:
         """What `subject` has waiting, for the page at the machine; with one
         of their keys, each with the envelope to sign."""
-        keys = self.keys_of(subject)
+        keys = set(self.keys_of(subject))
+        passkeys = self.passkeys_of(subject)
+        keys |= {p.id for p in passkeys}
         if self.links.for_subject(subject) is None or (key is not None and key not in keys):
             raise NotHeld(subject)
         enrollment = self.identity.load()
@@ -958,6 +1008,7 @@ class Host:
         return {
             "subject": subject,
             "keys": sorted(keys),
+            "passkeys": [p.view() for p in passkeys],
             "state": self.signing_state() if subject == owner else None,
             "items": items,
         }
@@ -966,6 +1017,65 @@ class Host:
         """Apply a held change (or the rules as a whole) once its person's
         key has signed it at the machine."""
         subject = approval.subject
+
+        def verify(site: str, enrolled_at: str, act: str, args: dict[str, Any]) -> tuple[str, int]:
+            checked = signing.check(
+                approval.envelope,
+                approval.signature,
+                site=site,
+                enrolled_at=enrolled_at,
+                person=subject,
+                act=act,
+                args=args,
+                keys=self.keys_of(subject),
+                key=approval.key,
+                last_seq=self.sequence.last(subject),
+            )
+            return checked.key.id, checked.seq
+
+        return await self._approve(ident, subject, verify, "at the machine with key")
+
+    async def approve_passkey(self, subject: str, approval: SitePasskeyApproval) -> dict[str, Any]:
+        """The same, approved from Workbench with one of `subject`'s passkeys
+        (J14a.3): the assertion, then the envelope's own checks."""
+
+        def verify(site: str, enrolled_at: str, act: str, args: dict[str, Any]) -> tuple[str, int]:
+            found = next((p for p in self.passkeys_of(subject) if p.id == approval.key), None)
+            if found is None:
+                raise signing.NotSigned(
+                    "That passkey is not one of yours here. Pair it again with a code from "
+                    "the machine."
+                )
+            count = pk.verify_assertion(
+                found,
+                approval.envelope,
+                credential_id=approval.credentialId,
+                authenticator_data=approval.authenticatorData,
+                client_data_json=approval.clientDataJSON,
+                signature=approval.signature,
+            )
+            seq = signing.check_envelope(
+                approval.envelope,
+                site=site,
+                enrolled_at=enrolled_at,
+                person=subject,
+                act=act,
+                args=args,
+                key=approval.key,
+                last_seq=self.sequence.last(subject),
+            )
+            self.passkeys.counted(found.id, count)
+            return found.id, seq
+
+        return await self._approve(approval.id, subject, verify, "from Workbench with passkey")
+
+    async def _approve(
+        self,
+        ident: str,
+        subject: str,
+        verify: Callable[[str, str, str, dict[str, Any]], tuple[str, int]],
+        how: str,
+    ) -> dict[str, Any]:
         if self.links.for_subject(subject) is None:
             raise NotHeld(subject)
         owner = self.identity.owner()
@@ -992,20 +1102,9 @@ class Host:
                     # The rules as they are now, not as they were when listed.
                     args = {"digest": self.policy.digest()}
                 try:
-                    checked = signing.check(
-                        approval.envelope,
-                        approval.signature,
-                        site=enrollment.site,
-                        enrolled_at=enrollment.enrolledAt,
-                        person=subject,
-                        act=act,
-                        args=args,
-                        keys=self.keys_of(subject),
-                        key=approval.key,
-                        last_seq=self.sequence.last(subject),
-                    )
+                    key_id, seq = verify(enrollment.site, enrollment.enrolledAt, act, args)
                     # Spent before it is applied: one signature, one try.
-                    self.sequence.accept(subject, checked.seq)
+                    self.sequence.accept(subject, seq)
                 except signing.NotSigned as exc:
                     raise Refused(str(exc)) from None
                 result: dict[str, Any] = {}
@@ -1024,11 +1123,11 @@ class Host:
             **entry,
             decision="allowed",
             outcome="done",
-            reason=f"Approved at the machine with key {checked.key.id[:8]}.",
+            reason=f"Approved {how} {key_id[:8]}.",
         )
         return {"status": "done", "result": result}
 
-    def reject(self, ident: str, subject: str) -> None:
+    def reject(self, ident: str, subject: str, where: str = "at the machine") -> None:
         held = self.held.get(ident)
         if held is None or held.subject != subject:
             raise NotHeld(ident)
@@ -1039,7 +1138,144 @@ class Host:
             action=held.action,
             arguments=held.arguments,
             decision="refused",
-            reason="Turned down at the machine.",
+            reason=f"Turned down {where}.",
+        )
+
+    # --- passkeys from Workbench (J14a.3) --------------------------------------------
+
+    async def _passkey_action(
+        self, name: str, owner: str, arguments: dict[str, Any]
+    ) -> dict[str, Any]:
+        """A passkey's work from Workbench, through the root. None of it is
+        a change to what this machine allows: pairing needs the code shown at
+        the machine, an approval needs the passkey's signature, and turning a
+        change down keeps access from being given, as removing a passkey
+        takes a key away (a lost phone)."""
+        if name == "held.approve":
+            approval = self._parse(SitePasskeyApproval, arguments)
+            try:
+                return await self.approve_passkey(owner, approval)
+            except NotHeld:
+                return {"status": "failed", "message": _NOT_WAITING}
+        if name == "held.list":
+            value = self._parse(SiteHeldListRequest, arguments)
+            try:
+                listed = await asyncio.to_thread(self.held_list, owner, value.key)
+            except NotHeld:
+                return {"status": "failed", "message": _NO_PASSKEY}
+            return {"status": "done", "result": listed}
+        if name == "held.reject":
+            rejected = self._parse(SiteHeldRejectRequest, arguments)
+            try:
+                self.reject(rejected.id, owner, "from Workbench")
+            except NotHeld:
+                return {"status": "failed", "message": _NOT_WAITING}
+            return {"status": "done", "result": {}}
+        if name == "passkey.remove":
+            removed = self._parse(SitePasskeyRemove, arguments)
+            # Not while an approval with it is being checked.
+            async with self.lock:
+                try:
+                    await asyncio.to_thread(
+                        self.passkey_remove, owner, removed.id, "from Workbench"
+                    )
+                except NotHeld:
+                    return {"status": "failed", "message": _NO_SUCH_PASSKEY}
+            return {"status": "done", "result": {}}
+        pairing = self._parse(SitePasskeyPair, arguments)
+        entry = {
+            "subject": owner,
+            "kind": "manage",
+            "action": name,
+            "arguments": {"rpId": pairing.rpId, "label": pairing.label},
+        }
+        try:
+            passkey = await self._pair(owner, pairing)
+        except Refused as exc:
+            self.audit.record(**entry, decision="refused", reason=str(exc))
+            return {"status": "failed", "message": str(exc)}
+        self.audit.record(
+            **entry,
+            decision="allowed",
+            outcome="done",
+            reason=f"Passkey {passkey.id[:8]} paired from Workbench with the code shown here.",
+        )
+        return {"status": "done", "result": passkey.view()}
+
+    async def _pair(self, owner: str, value: SitePasskeyPair) -> pk.Passkey:
+        enrollment = self.identity.load()
+        link = self.links.for_subject(owner)
+        if enrollment is None or link is None:
+            raise Refused(
+                f"You are not linked to an account on {self._machine()}, so it has no code "
+                "for you. Link yourself there first."
+            )
+        alg = int(value.alg.value)
+        try:
+            passkey = pk.pair(
+                subject=owner,
+                site=enrollment.site,
+                account=link.account,
+                linked_at=link.linked_at,
+                credential_id=value.credentialId,
+                public_key=value.publicKey,
+                alg=alg,
+                rp_id=value.rpId,
+                label=value.label,
+            )
+            text = pk.binding(
+                site=enrollment.site,
+                person=owner,
+                credential_id=value.credentialId,
+                public_key=value.publicKey,
+                alg=alg,
+                rp_id=value.rpId,
+            )
+            await asyncio.to_thread(
+                self.codes.check, owner, site=enrollment.site, text=text, given=value.mac
+            )
+            return self.passkeys.add(passkey)
+        except signing.NotSigned as exc:
+            raise Refused(str(exc)) from None
+
+    def _linked_here(self, subject: str) -> Link:
+        link = self.links.for_subject(subject)
+        if link is None:
+            raise NotHeld(subject)
+        return link
+
+    def passkey_code(self, subject: str) -> dict[str, Any]:
+        """A code for the starter to show (`POST /v1/passkeys/code`). Only
+        the owner's keys approve anything, so only the owner gets one."""
+        self._linked_here(subject)
+        if subject != self.identity.owner():
+            raise NotHeld(subject)
+        code, expires = self.codes.make(subject)
+        return {"subject": subject, "code": code, "expiresAt": _iso(expires)}
+
+    def passkey_list(self, subject: str) -> dict[str, Any]:
+        self._linked_here(subject)
+        waiting = self.codes.waiting(subject)
+        return {
+            "subject": subject,
+            "passkeys": [p.view() for p in self.passkeys_of(subject)],
+            "codeExpiresAt": _iso(waiting) if waiting is not None else None,
+        }
+
+    def passkey_remove(self, subject: str, ident: str, where: str = "at the machine") -> None:
+        """A passkey goes, at the machine (J45) or from Workbench (J60). What
+        it approved stays; with no key left, no tool runs (J48)."""
+        self._linked_here(subject)
+        if not self.passkeys.remove(subject, ident):
+            raise NotHeld(ident)
+        self.audit.record(
+            subject=subject,
+            kind="manage",
+            action="passkey.remove",
+            arguments={"id": ident},
+            decision="allowed",
+            outcome="done",
+            reason=f"Removed {where}.",
         )
 
     # --- a change in this site's own words ------------------------------------------
@@ -1225,7 +1461,7 @@ class Host:
                     "accountName": link.account_name,
                     "available": available,
                     "reason": None if available else self._not_running(link, own=True),
-                    "keys": len(link.keys),
+                    "keys": len(link.keys) + len(self.passkeys_of(link.subject)),
                 }
             )
         return views
@@ -1257,6 +1493,7 @@ class Host:
                 "state": self.signing_state(),
                 "held": len(self.held.all()),
                 "approvePage": self.approve_page(),
+                "passkeys": True,
             },
         }
 

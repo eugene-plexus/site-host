@@ -10,6 +10,9 @@ The site host holds this site's enrollment and reaches its root itself
   It answers only to the token this host writes to `local_token` in its own
   data directory, which its starter can read and nobody else; and even then
   the signature, not the caller, decides.
+- `/v1/passkeys`, the same starter's (J14a.3): a code for pairing the owner's
+  passkey from Workbench, to show at the machine, and the passkeys pinned
+  here, to list and remove.
 """
 
 from __future__ import annotations
@@ -26,7 +29,7 @@ from fastapi.responses import JSONResponse, Response
 from pydantic import ValidationError
 
 from . import signing
-from ._generated.models import SiteApproval, SiteHeldReject
+from ._generated.models import SiteApproval, SiteHeldReject, SitePasskeyCodeRequest
 from .channel import Channel
 from .host import Host, NotHeld
 from .identity import Identity, IdentityError
@@ -138,6 +141,46 @@ def create_app(settings: Settings, *, channel: Channel | None = None) -> FastAPI
             return JSONResponse({"detail": "This request is not valid."}, status_code=422)
         try:
             await asyncio.to_thread(host.reject, ident, value.subject)
+        except NotHeld:
+            return not_found()
+        return Response(status_code=204, headers=_PRIVATE)
+
+    # --- passkeys from Workbench (J14a.3) ---------------------------------------------
+
+    @app.post("/v1/passkeys/code")
+    async def passkey_code(request: Request) -> Response:
+        if not allowed(request):
+            return unauthorized()
+        try:
+            value = SitePasskeyCodeRequest.model_validate(await body(request))
+        except ValidationError:
+            return JSONResponse({"detail": "This request is not valid."}, status_code=422)
+        try:
+            made = host.passkey_code(value.subject)
+        except NotHeld:
+            return not_found()
+        return JSONResponse(made, headers=_PRIVATE)
+
+    @app.get("/v1/passkeys")
+    async def passkeys(
+        request: Request, subject: str = Query(min_length=1, max_length=64)
+    ) -> Response:
+        if not allowed(request):
+            return unauthorized()
+        try:
+            listed = await asyncio.to_thread(host.passkey_list, subject)
+        except NotHeld:
+            return not_found()
+        return JSONResponse(listed, headers=_PRIVATE)
+
+    @app.delete("/v1/passkeys/{ident}")
+    async def passkey_remove(
+        request: Request, ident: str, subject: str = Query(min_length=1, max_length=64)
+    ) -> Response:
+        if not allowed(request):
+            return unauthorized()
+        try:
+            await asyncio.to_thread(host.passkey_remove, subject, ident)
         except NotHeld:
             return not_found()
         return Response(status_code=204, headers=_PRIVATE)

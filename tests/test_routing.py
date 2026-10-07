@@ -426,6 +426,7 @@ async def test_the_summary_carries_links_link_page_and_sharing(
         "state": "unsigned",
         "held": 0,
         "approvePage": "http://127.0.0.1:8079/link/approve",
+        "passkeys": True,
     }
     assert by_subject[BO]["available"] is False and by_subject[BO]["accountName"] == "HOST/bo"
     assert ABSENT_WORDS in by_subject[BO]["reason"]

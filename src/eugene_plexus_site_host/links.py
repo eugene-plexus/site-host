@@ -37,6 +37,9 @@ class Link:
     account_name: str
     name: str | None
     keys: tuple[PersonKey, ...] = ()
+    #: When the starter made it: a passkey paired under an earlier link of
+    #: the same person is not this link's (J14a.3).
+    linked_at: str = ""
 
 
 class Links:
@@ -85,7 +88,14 @@ class Links:
                 )
                 if key is not None
             )
-            link = Link(entry.subject, entry.account, entry.accountName, entry.name, keys)
+            link = Link(
+                entry.subject,
+                entry.account,
+                entry.accountName,
+                entry.name,
+                keys,
+                entry.linkedAt.isoformat(),
+            )
             # One link per person and one person per account: a file that
             # breaks either rule is the starter's mistake, and the safe
             # reading drops every entry involved rather than choose.
