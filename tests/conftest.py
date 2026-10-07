@@ -4,6 +4,7 @@ import asyncio
 import contextlib
 import hashlib
 import json
+import os
 import secrets
 import shutil
 import sys
@@ -93,8 +94,10 @@ def write_links(path: Path, *entries: dict[str, str]) -> None:
 
 
 #: An account no worker of these tests ever holds: a SID shape on Windows, a
-#: uid on POSIX.
-OTHER_ACCOUNT = "S-1-5-21-1-2-3-1001" if sys.platform == "win32" else "1001"
+#: uid on POSIX. Never a fixed uid: GitHub's runner IS uid 1001, so a fixed
+#: "1001" made every stranger check the test's own account and one test waited
+#: for a refusal that never came (CI hung an hour, 2026-10-06).
+OTHER_ACCOUNT = "S-1-5-21-1-2-3-1001" if sys.platform == "win32" else str(os.getuid() + 1)
 
 
 class Site:
