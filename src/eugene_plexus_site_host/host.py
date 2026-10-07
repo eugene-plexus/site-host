@@ -739,6 +739,9 @@ class Host:
         return "signed" if self.policy.approved() else "unconfirmed"
 
     def approve_page(self) -> str | None:
+        if self.settings.approve_page:
+            return self.settings.approve_page
+        # An agent from before J14a.2 named only the link page.
         page = self.settings.link_page
         return f"{page.rstrip('/')}/approve" if page else None
 

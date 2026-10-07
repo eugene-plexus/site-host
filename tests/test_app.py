@@ -142,6 +142,15 @@ def test_the_links_channel_and_link_page_come_from_the_environment(tmp_path: Pat
     assert bare.unavailable() is not None
 
 
+def test_the_approve_page_comes_from_the_environment(tmp_path: Path) -> None:
+    """A per-user install has an approve page and no link page (J14a.2)."""
+    env = {**site_env(tmp_path), "SITE_HOST_APPROVE_PAGE": "http://127.0.0.1:8079/link/approve"}
+    settings = from_environment(env)
+    assert settings.approve_page == "http://127.0.0.1:8079/link/approve"
+    assert settings.link_page is None
+    assert from_environment(site_env(tmp_path)).approve_page is None
+
+
 def test_unavailable_is_only_the_platform_and_the_channel(tmp_path: Path) -> None:
     assert settings_for(tmp_path, channel="x").unavailable() is None
     assert "no channel" in (settings_for(tmp_path, channel=None).unavailable() or "")

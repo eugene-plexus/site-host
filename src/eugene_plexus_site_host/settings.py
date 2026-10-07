@@ -46,6 +46,10 @@ class Settings:
     links_file: Path | None = None
     channel: str | None = None
     link_page: str | None = None
+    #: Where a person adds a key and approves held changes, at the machine
+    #: (J14a). Set on every install that has the page, including a per-user
+    #: one, which links nobody and so has no `link_page` (J14a.2).
+    approve_page: str | None = None
     #: Whether anyone but the owner may be served. False on macOS, which has
     #: no folder boundary yet (§2.6).
     sharing: bool = sys.platform != "darwin"
@@ -108,4 +112,5 @@ def from_environment(env: Mapping[str, str] | None = None) -> Settings:
         links_file=Path(links) if links else None,
         channel=values.get("SITE_HOST_CHANNEL") or None,
         link_page=values.get("SITE_HOST_LINK_PAGE") or None,
+        approve_page=values.get("SITE_HOST_APPROVE_PAGE") or None,
     )

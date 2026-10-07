@@ -214,6 +214,22 @@ async def test_an_unsigned_site_says_so_and_runs_nothing(open_site: OpenSite, fo
     assert summary is not None and summary["signing"]["state"] == "unsigned"
 
 
+async def test_a_per_user_site_names_its_approve_page_with_no_link_page(
+    open_site: OpenSite, folder: Path
+) -> None:
+    """J14a.2: a per-user install links nobody, so it has no link page; its
+    approve page is its own setting, and the refusal and the summary name it."""
+    page = "http://127.0.0.1:8079/link/approve"
+    site = await open_site(signed=False, approve_page=page)
+    notes = await added(site, folder)
+    assert (await people(site, notes, (ADA, False)))["status"] == "done"
+    refused = await site.mcp(ADA, FILES, "tools/call", read())
+    assert refused["status"] == "failed" and page in refused["message"]
+    summary = site.host.summary()
+    assert summary is not None
+    assert summary["linkPage"] is None and summary["signing"]["approvePage"] == page
+
+
 async def test_a_change_that_gives_access_is_held_until_signed(site: Site, folder: Path) -> None:
     notes = await added(site, folder)
     held = await people(site, notes, (BO, False), approve=False)
