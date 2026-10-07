@@ -454,3 +454,89 @@ def test_the_approval_api_answers_its_token_only(tmp_path: Path) -> None:
         )
         bad = client.post("/v1/held/nothing/approve", json={"subject": ADA}, headers=auth)
         assert bad.status_code == 422
+
+
+async def test_a_key_pinned_to_someone_else_does_not_approve_the_owners_change(
+    open_site: OpenSite, folder: Path
+) -> None:
+    bo_key = PersonKey()
+    site = await open_site()
+    assert site.key is not None
+    path = site.host.settings.links_file
+    assert path is not None
+    write_links(
+        path,
+        link_entry(ADA, local_channel.own_account(), "ada", [site.key]),
+        link_entry(BO, OTHER_ACCOUNT, "bo", [bo_key]),
+    )
+    notes = await added(site, folder)
+    await people(site, notes, (BO, False), approve=False)
+    item = site.host.held.for_subject(ADA)[0]
+    text = next(i for i in site.host.held_list(ADA, site.key.id)["items"] if i["id"] == item.id)[
+        "envelope"
+    ].replace(site.key.id, bo_key.id)
+    refused = await site.host.approve(
+        item.id,
+        SiteApproval(subject=ADA, envelope=text, key=bo_key.id, signature=bo_key.sign(text)),
+    )
+    assert refused["status"] == "failed" and "not one this person has" in refused["message"]
+    assert site.host.policy.folders_for(BO) == []
+
+
+async def test_a_pinned_key_whose_id_is_not_its_own_is_no_key(
+    open_site: OpenSite, folder: Path
+) -> None:
+    site = await open_site(signed=False)
+    key = PersonKey()
+    entry = link_entry(ADA, local_channel.own_account(), "ada", [key])
+    entry["keys"][0]["id"] = "0" * 32
+    path = site.host.settings.links_file
+    assert path is not None
+    write_links(path, entry)
+    import os
+
+    stamp = path.stat()
+    os.utime(path, ns=(stamp.st_atime_ns, stamp.st_mtime_ns + 5_000_000_000))
+    assert site.host.keys_of(ADA) == {}
+    assert site.host.signing_state() == "unsigned"
+
+
+async def test_two_approvals_of_one_change_apply_it_once(site: Site, folder: Path) -> None:
+    notes = await added(site, folder)
+    await people(site, notes, (BO, False), approve=False)
+    item = site.host.held.for_subject(ADA)[0]
+    assert site.key is not None
+    first = next(i for i in site.host.held_list(ADA, site.key.id)["items"] if i["id"] == item.id)
+    import asyncio
+
+    def approval(text: str) -> SiteApproval:
+        return SiteApproval(
+            subject=ADA, envelope=text, key=site.key.id, signature=site.key.sign(text)
+        )  # type: ignore[union-attr]
+
+    # The second carries the next sequence number, as a page listing again would.
+    second = first["envelope"].replace('"seq":1', '"seq":2')
+    answers = await asyncio.gather(
+        site.host.approve(item.id, approval(first["envelope"])),
+        site.host.approve(item.id, approval(second)),
+        return_exceptions=True,
+    )
+    done = [a for a in answers if isinstance(a, dict) and a["status"] == "done"]
+    assert len(done) == 1, answers
+    assert (
+        sum(
+            1
+            for e in site.host.audit.newest(20)
+            if e.get("outcome") == "done" and e.get("action") == "folder.people"
+        )
+        == 1
+    )
+
+
+async def test_leaving_drops_what_was_held(site: Site, folder: Path) -> None:
+    notes = await added(site, folder)
+    await people(site, notes, (BO, False), approve=False)
+    assert site.host.held.all()
+    site.host.identity.forget()
+    assert site.host.held.all() == []
+    assert site.host.policy.folders, "the owner's rules stay"

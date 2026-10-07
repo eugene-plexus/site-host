@@ -977,6 +977,10 @@ class Host:
             act, args = held.action, held.arguments
         entry = {"subject": subject, "kind": "manage", "action": act, "arguments": args}
         async with self.lock:
+            # Another approval of the same change may have run while this one
+            # waited: what is applied is what is still held.
+            if ident != RULES and self.held.get(ident) is None:
+                raise NotHeld(ident)
             try:
                 enrollment = self.identity.load()
                 if enrollment is None or subject != owner:

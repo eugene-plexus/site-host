@@ -38,6 +38,8 @@ from ._private_files import write_private_text
 ENROLLMENT_FILE = "site.json"
 KEY_FILE = "site_key.pem"
 PINS_FILE = "root_tls.json"
+#: `signing.HeldStore`'s file.
+HELD_FILE = "held.json"
 TOKEN_SECONDS = 240
 AUDIENCE = "control"
 
@@ -143,10 +145,11 @@ class Identity:
         self._key = key
 
     def forget(self) -> None:
-        """Leave: the enrollment, the key and the pins go. The policy and the
-        audit log stay; they are the owner's, and a site joined again by the
-        same person reads them."""
-        for name in (ENROLLMENT_FILE, KEY_FILE, PINS_FILE):
+        """Leave: the enrollment, the key and the pins go, and the changes held
+        for approval (J14a), which the root of this enrollment asked for. The
+        policy and the audit log stay; they are the owner's, and a site joined
+        again by the same person reads them."""
+        for name in (ENROLLMENT_FILE, KEY_FILE, PINS_FILE, HELD_FILE):
             (self.data_dir / name).unlink(missing_ok=True)
         self._cached = None
         self._key = None
