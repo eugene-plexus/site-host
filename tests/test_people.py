@@ -413,6 +413,9 @@ def test_hidden_matches_as_git_does_and_both_ways_when_the_kind_is_not_known() -
     assert hidden.hides(["deep", "k.pem"]) and hidden.hides(["build", "out"])
     assert not hidden.hides(["src", "build"]) and not hidden.hides(["src", "a.py"])
     assert not folder_io.Hidden([]).hides([".env"]) and not folder_io.Hidden()
+    # A folder's contents are hidden with it, however the pattern names it.
+    for pattern in ("secrets", "secrets/", "/secrets", "**/secrets"):
+        assert folder_io.Hidden([pattern]).hides(["secrets", "deep", "key.txt"], False), pattern
 
 
 # --- whose approval a call needs (J79) ---------------------------------------------------
@@ -460,7 +463,7 @@ async def test_an_unlinked_holders_workspace_is_never_opened_by_the_owners_worke
     stamp = path.stat()
     os.utime(path, ns=(stamp.st_atime_ns, stamp.st_mtime_ns + 9_000_000_000))
     refused = await call(site, BO, "read_text", folder="Mine", path="plan.txt")
-    assert refused["status"] == "failed"
+    assert refused["status"] == "failed" and "linked your own account" in refused["message"]
     assert "Mine" not in json.dumps(await site.mcp(BO, FILES, "tools/list"))
 
 
@@ -583,6 +586,9 @@ async def test_a_read_only_workspace_takes_no_change_rule(
 def test_on_windows_a_hidden_name_is_hidden_in_any_case_and_no_short_name_reaches_it() -> None:
     hidden = folder_io.Hidden([".env", "secrets/"])
     assert hidden.hides([".ENV"]) and hidden.hides(["Secrets", "key.txt"])
+    assert folder_io.Hidden([".ENV", "*.PEM"]).hides([".env"]) and folder_io.Hidden(
+        ["*.PEM"]
+    ).hides(["certs", "site.pem"])
     with pytest.raises(folder_io.FolderError, match="short name"):
         hidden.check(["SECRE~1", "key.txt"])
     folder_io.Hidden().check(["SECRE~1"])  # no patterns, nothing to reach
@@ -605,3 +611,23 @@ async def test_the_file_server_reads_only_where_the_rules_let_it(tmp_path: Path)
     read_b = {"name": "read_text", "arguments": {"folder": "B", "path": "x.txt"}}
     answer = await dispatch.exchange(built, rpc("tools/call", read_b))
     assert answer["result"]["isError"] is True
+
+
+async def test_deny_on_reading_is_not_offered_where_changing_is(
+    two: tuple[Site, PersonKey, Path],
+) -> None:
+    site, _bo, _mine = two
+    workspace = site.host.policy.own(BO)[0]["id"]
+    tighter = await site.manage(
+        BO,
+        "rules.set",
+        approve=False,
+        id=workspace,
+        rules={"read": "deny", "change": "ask"},
+        deny=[],
+    )
+    assert tighter["status"] == "done", tighter
+    listed = await tools(site, BO)
+    assert enum(listed, "read_text") == ["Notes"] and enum(listed, "write_text") == ["Mine"]
+    refused = await call(site, BO, "read_text", folder="Mine", path="plan.txt")
+    assert refused["status"] == "failed" and "may not read or search" in refused["message"]

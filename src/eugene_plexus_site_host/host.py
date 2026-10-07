@@ -618,12 +618,20 @@ class Host:
         linked = self.links.for_subject(subject) is not None
         if subject == owner and not linked:
             raise Refused(self._not_linked())
+        view = self.policy.view(subject)
         rows = [
             (name, workspace, rules, subject if mine else owner)
-            for name, workspace, rules, mine in self.policy.view(subject)
+            for name, workspace, rules, mine in view
             if linked or not mine
         ]
-        return self._files_target(subject, rows)
+        target = self._files_target(subject, rows)
+        # What the filter left out is theirs, opened only by their own worker:
+        # it says to link, whatever their keys' state.
+        kept = {name for name, *_ in rows}
+        for name, workspace, _, _ in view:
+            if name not in kept:
+                target.blocked[name] = (self._not_linked(), str(workspace["holder"]))
+        return target
 
     def _files_target(
         self, caller: str, rows: list[tuple[str, dict[str, Any], dict[str, str], str | None]]

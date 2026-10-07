@@ -400,7 +400,8 @@ async def test_an_edited_policy_file_cannot_make_a_read_only_folder_writable(
     notes = await add(first, folder, writable=False)
     await give(first, notes, (BO, False))
     policy = Policy.load(tmp_path / "data" / "policy.json")
-    policy.folders[0]["people"][0]["rules"]["write_text"] = "allow"
+    rules = policy.folders[0]["people"][0]["rules"]
+    rules["write_text"] = rules["edit_text"] = "allow"
     policy.save()
     await first.close()
     site = await open_site(tmp_path)

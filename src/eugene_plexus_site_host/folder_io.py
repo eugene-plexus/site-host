@@ -69,13 +69,11 @@ class Hidden:
         return bool(self.spec.match_file(relative.casefold() if _CASELESS else relative))
 
     def hides(self, names: list[str], directory: bool | None = None) -> bool:
-        """Whether `names` is hidden: it, or a folder it is in. `directory`
-        None (not known) matches it both as a file and as a folder."""
+        """Whether `names` is hidden: it, or (as git reads a pattern) a folder
+        it is in. `directory` None (not known) matches it both as a file and
+        as a folder."""
         if self.spec is None or not names:
             return False
-        for depth in range(1, len(names)):
-            if self._match("/".join(names[:depth]) + "/"):
-                return True
         whole = "/".join(names)
         if directory is not False and self._match(whole + "/"):
             return True
