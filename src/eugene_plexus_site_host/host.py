@@ -869,6 +869,9 @@ class Host:
                 raise Refused("This machine has no such server.")
             if not self.policy.enabled.get(server):
                 raise Refused(f"Turn {local.name} on before saying who may use it.")
+            # The tools it listed last, when it has: the rest is checked again
+            # with a fresh list when the change is approved.
+            known = {t.name: t for t in self.local.known_tools(local)}
             for entry in access.people:
                 if entry.subject == OPERATOR:
                     raise Refused(
@@ -876,6 +879,15 @@ class Host:
                         "site's settings instead."
                     )
                 self._only_owner(entry.subject)
+                for grant in entry.tools if known else ():
+                    tool = known.get(grant.name)
+                    if tool is None:
+                        raise Refused(f"{local.name} has no tool named {grant.name!r}.")
+                    if is_destructive(tool) and not grant.standing:
+                        raise Refused(
+                            f"{grant.name} can change things on this machine. Grant it as a "
+                            "standing pre-approval, or not at all."
+                        )
         elif name == "server.enable":
             enable = self._parse(SiteServerEnable, arguments)
             local = self.local.entries.get(str(enable.server))

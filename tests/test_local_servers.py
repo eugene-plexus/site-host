@@ -35,9 +35,15 @@ async def test_a_new_tool_arrives_with_its_server_and_runs_under_the_sites_polic
     assert tools["echo"]["readOnly"] and not tools["echo"]["destructive"]
     assert tools["touch"]["destructive"], "an unmarked tool is destructive, as MCP defaults"
     refused = await site.manage(
-        ADA, "access.set", server="fixture", people=[{"subject": BO, "tools": [{"name": "touch"}]}]
+        ADA,
+        "access.set",
+        approve=False,
+        server="fixture",
+        people=[{"subject": BO, "tools": [{"name": "touch"}]}],
     )
     assert refused["status"] == "failed" and "standing pre-approval" in refused["message"]
+    # Refused now, from the tools the server listed: nothing is held (J14a).
+    assert site.host.held.all() == []
     granted = await site.manage(
         ADA, "access.set", server="fixture", people=[{"subject": BO, "tools": [{"name": "echo"}]}]
     )
