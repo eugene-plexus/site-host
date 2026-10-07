@@ -8,9 +8,10 @@ host's audit log in the host's own directory.
 
 Default deny (J8). A folder is open only to the people on its own list: to
 read, or also to change files, which is a standing pre-approval for
-`write_text` (J6g). A local server is off until its owner turns it on, and a
-person has none of its tools until the owner names them; a destructive tool
-is named with `standing: true`, a standing pre-approval, or not at all.
+`write_text` and `edit_text` (J6g). A local server is off until its owner
+turns it on, and a person has none of its tools until the owner names them;
+a destructive tool is named with `standing: true`, a standing pre-approval,
+or not at all.
 
 **Approved** (J14a, J52): `authorized` is the digest of the rules as their
 owner last approved them with their own key, at the machine. Rules whose

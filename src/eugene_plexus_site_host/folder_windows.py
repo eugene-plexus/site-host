@@ -18,7 +18,7 @@ from ctypes import wintypes as w
 from pathlib import Path
 from typing import Any, Self
 
-from .folder_io import FolderError, parts
+from .folder_io import Entry, FolderError, parts
 
 if sys.platform == "win32":
 
@@ -196,10 +196,13 @@ if sys.platform == "win32":
                 finally:
                     os.close(fd)
 
-        def names(self, names: list[str], limit: int) -> list[str]:
+        def _enumerate(self, names: list[str], limit: int, detailed: bool) -> list[Any]:
+            """The directory's entries, read from its handle: names only
+            (FileNamesInformation), or with attributes, size and write time
+            (FileDirectoryInformation), so a walk can skip a link unopened."""
             nt, _ = _apis()
             with self._directory(names) as parent:
-                result: list[str] = []
+                result: list[Any] = []
                 buffer = ctypes.create_string_buffer(65536)
                 status = _Status()
                 first = True
@@ -212,7 +215,7 @@ if sys.platform == "win32":
                         ctypes.byref(status),
                         buffer,
                         len(buffer),
-                        12,
+                        1 if detailed else 12,
                         False,
                         None,
                         first,
@@ -224,11 +227,47 @@ if sys.platform == "win32":
                         raise ctypes.WinError(nt.RtlNtStatusToDosError(code))
                     offset = 0
                     while offset < status.Information:
-                        next_offset, _, size = struct.unpack_from("<III", buffer, offset)
-                        name = buffer.raw[offset + 12 : offset + 12 + size].decode("utf-16-le")
+                        if detailed:
+                            # FILE_DIRECTORY_INFORMATION: LastWriteTime at 24,
+                            # EndOfFile at 40, FileAttributes and FileNameLength
+                            # at 56, FileName at 64.
+                            next_offset = struct.unpack_from("<I", buffer, offset)[0]
+                            written = struct.unpack_from("<q", buffer, offset + 24)[0]
+                            end = struct.unpack_from("<q", buffer, offset + 40)[0]
+                            attributes, size = struct.unpack_from("<II", buffer, offset + 56)
+                            start = offset + 64
+                        else:
+                            next_offset, _, size = struct.unpack_from("<III", buffer, offset)
+                            start = offset + 12
+                        name = buffer.raw[start : start + size].decode("utf-16-le")
                         if name not in {".", ".."}:
-                            result.append(name)
+                            if detailed:
+                                if attributes & 0x400:  # FILE_ATTRIBUTE_REPARSE_POINT
+                                    kind = "link"
+                                elif attributes & 0x10:  # FILE_ATTRIBUTE_DIRECTORY
+                                    kind = "dir"
+                                else:
+                                    kind = "file"
+                                # FILETIME: 100 ns ticks since 1601.
+                                mtime = (written - 116_444_736_000_000_000) * 100
+                                result.append(Entry(name, kind, end, mtime))
+                            else:
+                                result.append(name)
                         if not next_offset or len(result) >= limit:
                             break
                         offset += next_offset
                 return result
+
+        def names(self, names: list[str], limit: int) -> list[str]:
+            return [str(n) for n in self._enumerate(names, limit, False)]
+
+        def entries(self, names: list[str], limit: int) -> list[Entry]:
+            return [e for e in self._enumerate(names, limit, True) if isinstance(e, Entry)]
+
+        def is_directory(self, names: list[str]) -> bool:
+            try:
+                with self._directory(names):
+                    return True
+            except NotADirectoryError:
+                # Python raises ERROR_DIRECTORY (267) as this.
+                return False

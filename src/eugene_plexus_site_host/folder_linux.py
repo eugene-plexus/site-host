@@ -19,7 +19,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Self
 
-from .folder_io import FolderError
+from .folder_io import Entry, FolderError
 
 _fcntl = importlib.import_module("fcntl")
 
@@ -187,3 +187,32 @@ class Root:
                 if len(out) >= limit:
                     break
             return out
+
+    def entries(self, names: list[str], limit: int) -> list[Entry]:
+        """The directory's entries with their kind, size and write time, read
+        relative to its handle without following a link (`fstatat`)."""
+        with self._directory(names) as parent, os.scandir(parent) as found:
+            out: list[Entry] = []
+            for entry in found:
+                if len(out) >= limit:
+                    break
+                if entry.is_symlink():
+                    out.append(Entry(entry.name, "link", 0, 0))
+                    continue
+                if entry.is_dir(follow_symlinks=False):
+                    kind = "dir"
+                elif entry.is_file(follow_symlinks=False):
+                    kind = "file"
+                else:
+                    out.append(Entry(entry.name, "other", 0, 0))
+                    continue
+                info = entry.stat(follow_symlinks=False)
+                out.append(Entry(entry.name, kind, info.st_size, info.st_mtime_ns))
+            return out
+
+    def is_directory(self, names: list[str]) -> bool:
+        try:
+            with self._directory(names):
+                return True
+        except NotADirectoryError:
+            return False

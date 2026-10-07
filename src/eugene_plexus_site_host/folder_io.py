@@ -3,7 +3,9 @@
 Linux uses Landlock and one-component no-link traversal on held handles. Windows
 walks one name at a time relative to retained directory handles, refusing
 reparse points and holding parents against rename. Only regular, singly
-linked files are used. No shell, recursive traversal or automatic retries.
+linked files are used. No shell and no automatic retries. The one traversal,
+a search's walk (`workspace_tools`), opens one name at a time on the same
+handles, follows no link, enters no other mount and stops at a budget.
 """
 
 from __future__ import annotations
@@ -15,12 +17,17 @@ import stat
 import sys
 from collections.abc import Iterator
 from contextlib import contextmanager
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 MAX_BYTES = 32_768
 MAX_CHARACTERS = 16_384
 MAX_ENTRIES = 200
+#: The tools that change files: the folder's handle may write for them only.
+WRITING = frozenset({"write_text", "edit_text"})
+#: The tools whose `path` names a folder, `.` for the folder itself.
+DIRECTORY_PATHS = frozenset({"list_directory", "glob", "grep"})
 
 
 class FolderError(Exception):
@@ -29,6 +36,18 @@ class FolderError(Exception):
 
 class WriteUncertain(FolderError):
     """A write began but its completion could not be established."""
+
+
+@dataclass(frozen=True)
+class Entry:
+    """One name in a directory, as its handle lists it: `kind` is `file`,
+    `dir`, `link` (a symlink, junction or other reparse point, never
+    followed) or `other`."""
+
+    name: str
+    kind: str
+    size: int
+    mtime_ns: int
 
 
 def _utf8(text: str) -> bytes:
@@ -142,20 +161,20 @@ def operate(
 def _operate(
     path: str, expected: str, tool: str, arguments: dict[str, Any], protected: list[Path]
 ) -> dict[str, Any]:
-    names = parts(arguments["path"], directory=tool == "list_directory")
+    names = parts(arguments.get("path", "."), directory=tool in DIRECTORY_PATHS)
     with root(path, expected) as folder:
         check_root_path(folder.path, protected)
         if sys.platform.startswith("linux"):
-            folder.restrict(tool == "write_text")
+            folder.restrict(tool in WRITING)
+        if tool in {"read_text", "edit_text", "glob", "grep"}:
+            from . import workspace_tools
+
+            return workspace_tools.run(folder, tool, names, arguments)
         if tool == "list_directory":
             entries = folder.names(names, MAX_ENTRIES + 1)
             for entry in entries:
                 _utf8(entry)
             return {"names": sorted(entries[:MAX_ENTRIES]), "truncated": len(entries) > MAX_ENTRIES}
-        if tool == "read_text":
-            with folder.file(names) as fd:
-                text, digest = _read(fd)
-            return {"text": text, "sha256": digest}
         if tool != "write_text":
             raise FolderError("This file tool is not supported.")
         data = text_bytes(arguments["text"])
@@ -170,22 +189,29 @@ def _operate(
                     raise FolderError(
                         "The file changed. Read it again before proposing another edit."
                     )
-            try:
-                os.lseek(fd, 0, os.SEEK_SET)
-                pending = memoryview(data)
-                while pending:
-                    written = os.write(fd, pending)
-                    if written == 0:
-                        raise OSError("The write made no progress.")
-                    pending = pending[written:]
-                os.ftruncate(fd, len(data))
-                os.fsync(fd)
-            except OSError:
-                raise WriteUncertain(
-                    "The write did not finish reliably. The file may be partially "
-                    "changed. Check it before trying again."
-                ) from None
+            rewrite(fd, data)
         return {"written": len(data), "sha256": hashlib.sha256(data).hexdigest()}
+
+
+def rewrite(fd: int, data: bytes) -> None:
+    """The file's whole content, written in place over the open handle, then
+    flushed to disk. In place keeps the file's identity and permissions; a
+    write that stops midway is `WriteUncertain`, never retried."""
+    try:
+        os.lseek(fd, 0, os.SEEK_SET)
+        pending = memoryview(data)
+        while pending:
+            written = os.write(fd, pending)
+            if written == 0:
+                raise OSError("The write made no progress.")
+            pending = pending[written:]
+        os.ftruncate(fd, len(data))
+        os.fsync(fd)
+    except OSError:
+        raise WriteUncertain(
+            "The write did not finish reliably. The file may be partially "
+            "changed. Check it before trying again."
+        ) from None
 
 
 def check_root_path(path: str, protected: list[Path]) -> str:

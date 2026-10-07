@@ -37,6 +37,11 @@ dependencies = [
     # The local-server list an administrator writes at the machine (§6.2),
     # which the host and each worker read themselves.
     "pyyaml>=6,<7",
+    # The workspace tools' search (2b.3a): `.gitignore` as git reads it
+    # (J73), and patterns with a timeout, which Python's `re` cannot stop
+    # (J74).
+    "pathspec>=0.12,<2",
+    "regex>=2024.11.6",
 ]
 
 [project.optional-dependencies]
@@ -48,6 +53,7 @@ dev = [
     "datamodel-code-generator==0.57.0",
     "httpx>=0.27,<1",
     "types-PyYAML>=6,<7",
+    "types-regex>=2024.11.6",
 ]
 
 [project.scripts]

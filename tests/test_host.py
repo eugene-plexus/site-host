@@ -77,7 +77,12 @@ async def test_the_folder_argument_lists_only_what_was_granted(
     await add(site, other, name="Private", writable=True)
     await give(site, notes, (BO, False))
     answer = await site.mcp(BO, FILES, "tools/list")
-    assert listed(answer) == {"list_directory": ["Notes"], "read_text": ["Notes"]}
+    assert listed(answer) == {
+        "list_directory": ["Notes"],
+        "read_text": ["Notes"],
+        "glob": ["Notes"],
+        "grep": ["Notes"],
+    }
     got = await site.mcp(BO, FILES, "tools/call", read())
     assert got["status"] == "done" and "Notes from ada's desk" in text(got)
     refused = await site.mcp(BO, FILES, "tools/call", read("Private"))
@@ -339,7 +344,7 @@ async def test_the_report_is_the_sites_own_list(site: Site, folder: Path) -> Non
     ]
     files = summary["servers"][0]
     assert files["id"] == FILES and files["kind"] == "files" and files["enabled"] is True
-    assert [t["name"] for t in files["tools"]] == ["list_directory", "read_text"]
+    assert [t["name"] for t in files["tools"]] == ["list_directory", "read_text", "glob", "grep"]
     assert summary["access"] == []
 
 

@@ -17,7 +17,8 @@ anything runs:
    (J27). With no worker connected, it is refused, saying why.
 7. For `tools/call`: the tool is one the person may use, and a destructive
    tool has a standing pre-approval. On the file server, the `folder` it
-   names is one they may use, and for `write_text` one they may change.
+   names is one they may use, and for `write_text` or `edit_text` one they
+   may change.
 
 Then the worker serves it, `tools/list` is cut to the person's tools (the
 file server's `folder` argument to their folders), and the call is recorded
@@ -93,7 +94,7 @@ PROTOCOL = "mcp-2026-07-28"
 MAX_ANSWER = 70_000
 OPERATOR = "operator"
 FILES = file_server.SERVER
-READING = {"list_directory": False, "read_text": False}
+READING = {name: False for name in sorted(file_server.READ_ONLY)}
 #: How long a worker has to answer one call. A local server's own limit is
 #: 20 s (`local_servers.CALL_SECONDS`), and a claimed operation lives 30 s.
 WORKER_SECONDS = 25.0
@@ -346,7 +347,10 @@ class Host:
             self.audit.record(**entry, decision="refused", reason=str(exc))
             return {"status": "failed", "message": str(exc)}
         except (WorkerTimeout, WorkerGone, RuntimeError) as exc:
-            status = "uncertain" if method == "tools/call" else "failed"
+            # Only a call that can change something may have acted: a file
+            # server read or search that ran out of time did not.
+            reads = target.folders is not None and tool in file_server.READ_ONLY
+            status = "uncertain" if method == "tools/call" and not reads else "failed"
             message = f"{target.name} did not answer ({type(exc).__name__})." + (
                 " It may have acted. Check before trying again." if status == "uncertain" else ""
             )
@@ -379,7 +383,8 @@ class Host:
         )
 
     def _may_call(self, target: Target, tool: Any, arguments: Any) -> None:
-        if target.folders is not None and tool == "write_text" and tool not in target.allowed:
+        writes = tool in file_server.DESTRUCTIVE
+        if target.folders is not None and writes and tool not in target.allowed:
             raise Refused(
                 "You may read folders here but not change files in them. This machine's owner "
                 "can let you, from Workbench (Job sites)."
@@ -399,7 +404,7 @@ class Host:
         name = arguments.get("folder") if isinstance(arguments, dict) else None
         if not isinstance(name, str) or name not in target.folders:
             raise Refused(f"You have not been given a folder named {name!r} on this machine.")
-        if tool == "write_text" and name not in target.writable:
+        if writes and name not in target.writable:
             raise Refused(f"You may read {name} but not change files in it.")
 
     def _target(self, call: SiteCall) -> Target:
@@ -465,8 +470,8 @@ class Host:
         }
         allowed = dict(READING) if folders else {}
         if writable:
-            # Writing is the folder's own standing pre-approval (J6g).
-            allowed["write_text"] = True
+            # Changing files is the folder's own standing pre-approval (J6g).
+            allowed.update({name: True for name in file_server.DESTRUCTIVE})
         return Target(
             FILES,
             "this machine's file server",
