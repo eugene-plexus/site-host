@@ -20,6 +20,7 @@ from .conftest import (
     ADA,
     BO,
     OTHER_ACCOUNT,
+    OTHER_UID,
     OpenSite,
     Site,
     link_entry,
@@ -173,7 +174,7 @@ async def test_the_owner_not_linked_means_nothing_runs_and_it_says_so(
     ("account", "words"),
     [
         ("S-1-5-21-1-2-3-1001", ("not signed in", "owner is not signed in")),
-        ("1001", ("worker", "not running")),
+        (OTHER_UID, ("worker", "not running")),
     ],
 )
 async def test_the_owners_worker_absent_is_worded_for_the_kind_of_account(
