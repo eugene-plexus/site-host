@@ -296,8 +296,11 @@ async def test_taking_access_away_needs_no_signature_and_keeps_the_rules_signed(
         assert answer["status"] == "done", answer
         assert site.host.signing_state() == "signed"
     assert site.host.held.all() == []
-    # Giving back is held.
+    # Giving back is held, and so is a reader made a writer.
     assert (await people(site, notes, (ADA, True), (BO, False), approve=False))["status"] == "held"
+    await site.approve(site.host.held.for_subject(ADA)[0].id)
+    upgraded = await people(site, notes, (ADA, True), (BO, True), approve=False)
+    assert upgraded["status"] == "held" and site.host.policy.folders_for(BO)[0][1] is False
     off = await site.manage(ADA, "settings.set", ownerInDevMode=False, approve=False)
     assert off["status"] == "done"
     on = await site.manage(ADA, "settings.set", ownerInDevMode=True, approve=False)
@@ -332,8 +335,11 @@ async def test_rules_from_before_the_key_are_approved_as_a_whole(
     )
     refused = await site.host.approve(RULES, stale)
     assert refused["status"] == "failed" and "args differs" in refused["message"]
-    # Rules that grant nothing need no approval; give some back and approve them.
+    # A signed change does not approve the rest of the rules: only they as a
+    # whole are. (Rules that grant nothing need no approval.)
     assert (await people(site, notes, (ADA, False), approve=False))["status"] == "held"
+    assert (await people(site, notes, (ADA, False), (BO, False)))["status"] == "done"
+    assert site.host.signing_state() == "unconfirmed"
     assert (await site.confirm_rules())["status"] == "done"
     assert site.host.signing_state() == "signed"
 
@@ -514,8 +520,19 @@ async def test_two_approvals_of_one_change_apply_it_once(site: Site, folder: Pat
             subject=ADA, envelope=text, key=site.key.id, signature=site.key.sign(text)
         )  # type: ignore[union-attr]
 
-    # The second carries the next sequence number, as a page listing again would.
-    second = first["envelope"].replace('"seq":1', '"seq":2')
+    # The second carries the next sequence number, as a page listing again
+    # would. The change takes a moment to apply, so the second is already
+    # waiting for the lock when the first finishes.
+    listed_seq = json.loads(first["envelope"])["seq"]
+    second = first["envelope"].replace(f'"seq":{listed_seq}', f'"seq":{listed_seq + 1}')
+    assert second != first["envelope"]
+    apply = site.host._folder_people
+
+    async def slowly(arguments: dict[str, Any]) -> dict[str, Any]:
+        await asyncio.sleep(0.05)
+        return await apply(arguments)
+
+    site.host._folder_people = slowly  # type: ignore[method-assign]
     answers = await asyncio.gather(
         site.host.approve(item.id, approval(first["envelope"])),
         site.host.approve(item.id, approval(second)),
@@ -540,3 +557,13 @@ async def test_leaving_drops_what_was_held(site: Site, folder: Path) -> None:
     site.host.identity.forget()
     assert site.host.held.all() == []
     assert site.host.policy.folders, "the owner's rules stay"
+
+
+async def test_at_most_32_changes_wait(site: Site, folder: Path) -> None:
+    notes = await added(site, folder)
+    for i in range(signing.MAX_HELD):
+        held = await people(site, notes, (f"person-{i}", False), approve=False)
+        assert held["status"] == "held", held
+    full = await people(site, notes, ("person-last", False), approve=False)
+    assert full["status"] == "failed" and "32 changes are already waiting" in full["message"]
+    assert len(site.host.held.all()) == signing.MAX_HELD

@@ -350,10 +350,10 @@ class Sequence:
         return value if type(value) is int and value > 0 else 0
 
     def accept(self, subject: str, seq: int) -> None:
+        """Record `seq` as spent. `check` already refused anything not newer,
+        under the host's lock, which this is called inside of."""
         with self._lock:
             seqs = dict(_load(self.path).get("seq") or {})
-            if seq <= int(seqs.get(subject) or 0):
-                raise NotSigned("This approval is older than one already used here.")
             seqs[subject] = seq
             self.path.parent.mkdir(parents=True, exist_ok=True)
             write_private_text(self.path, json.dumps({"version": 1, "seq": seqs}))

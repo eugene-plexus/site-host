@@ -29,7 +29,10 @@ async def test_a_new_tool_arrives_with_its_server_and_runs_under_the_sites_polic
     tmp_path: Path, open_site: OpenSite
 ) -> None:
     site = await site_with(open_site, tmp_path)
-    on = await site.manage(ADA, "server.enable", server="fixture", enabled=True)
+    # Turning a server on is held for the owner's key (J14a), then approved.
+    held = await site.manage(ADA, "server.enable", approve=False, server="fixture", enabled=True)
+    assert held["status"] == "held" and not site.host.policy.enabled.get("fixture")
+    on = await site.approve(site.host.held.for_subject(ADA)[0].id)
     assert on["status"] == "done", on
     tools = {t["name"]: t for t in on["result"]["server"]["tools"]}
     assert tools["echo"]["readOnly"] and not tools["echo"]["destructive"]
@@ -48,6 +51,16 @@ async def test_a_new_tool_arrives_with_its_server_and_runs_under_the_sites_polic
         ADA, "access.set", server="fixture", people=[{"subject": BO, "tools": [{"name": "echo"}]}]
     )
     assert granted["status"] == "done", granted
+    # A tool more for someone already on the list is held too.
+    more = await site.manage(
+        ADA,
+        "access.set",
+        approve=False,
+        server="fixture",
+        people=[{"subject": BO, "tools": [{"name": "echo"}, {"name": "touch", "standing": True}]}],
+    )
+    assert more["status"] == "held" and site.host.policy.tools_for(BO, "fixture") == {"echo": False}
+    site.host.reject(site.host.held.for_subject(ADA)[0].id, ADA)
     echoed = await site.mcp(
         BO, "fixture", "tools/call", {"name": "echo", "arguments": {"text": "hi"}}
     )
