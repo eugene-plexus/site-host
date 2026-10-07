@@ -39,9 +39,16 @@ def read(name: str = "Notes", path: str = "note.txt") -> dict[str, Any]:
     return {"name": "read_text", "arguments": {"folder": name, "path": path}}
 
 
-def relink(site: Site, *entries: dict[str, str]) -> None:
+def relink(site: Site, *entries: dict[str, Any]) -> None:
+    """Rewrite the links as the starter would. The owner's entry keeps the
+    owner's pinned key (J14a) unless it names keys of its own."""
     path = site.host.settings.links_file
     assert path is not None
+    if site.key is not None:
+        entries = tuple(
+            {**e, "keys": [site.key.entry()]} if e["subject"] == ADA and "keys" not in e else e
+            for e in entries
+        )
     write_links(path, *entries)
     stamp = path.stat()
     os.utime(path, ns=(stamp.st_atime_ns, stamp.st_mtime_ns + 7_000_000_000))
@@ -159,15 +166,13 @@ async def test_the_owner_not_linked_means_nothing_runs_and_it_says_so(
     await shared(site, folder, ADA, BO, CY)
     relink(site, link_entry(BO, site.account, "bo"))
     sent = record_calls(site)
-    own = await site.mcp(ADA, FILES, "tools/call", read())
-    assert own["status"] == "failed" and "not linked your own account" in own["message"], own
-    other = await site.mcp(CY, FILES, "tools/call", read())
-    assert other["status"] == "failed" and "owner has not linked" in other["message"], other
+    # The owner's key is pinned with their link (J14a): no link, no key, and
+    # an unsigned site runs nothing, a linked person's calls included (J48).
+    for subject in (ADA, CY, BO):
+        refused = await site.mcp(subject, FILES, "tools/call", read())
+        assert refused["status"] == "failed" and "own key" in refused["message"], refused
     assert sent == []
-    # A person who is linked is not held up by the owner's missing link.
-    served = await site.mcp(BO, FILES, "tools/call", read())
-    assert served["status"] == "done", served
-    assert sent == [ME]
+    assert site.host.signing_state() == "unsigned"
 
 
 @pytest.mark.parametrize(
@@ -415,6 +420,12 @@ async def test_the_summary_carries_links_link_page_and_sharing(
         "accountName": "HOST/ada",
         "available": True,
         "reason": None,
+        "keys": 0,
+    }
+    assert summary["signing"] == {
+        "state": "unsigned",
+        "held": 0,
+        "approvePage": "http://127.0.0.1:8079/link/approve",
     }
     assert by_subject[BO]["available"] is False and by_subject[BO]["accountName"] == "HOST/bo"
     assert ABSENT_WORDS in by_subject[BO]["reason"]

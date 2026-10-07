@@ -11,6 +11,10 @@ without a restart, and a removed one ends that account's worker connection
 at the next check. A file that cannot be read or does not parse means no
 links: nobody's calls run as anybody until it is put right, and the report
 says why.
+
+A link may carry the person's own keys (J14a), pinned at the machine by the
+same starter: the site checks every change that person approves against
+them. A key whose id is not its own is dropped, never trusted.
 """
 
 from __future__ import annotations
@@ -23,6 +27,7 @@ from pathlib import Path
 from pydantic import ValidationError
 
 from ._generated.models import SiteLinkFile
+from .signing import PersonKey, parse_key
 
 
 @dataclass(frozen=True)
@@ -31,6 +36,7 @@ class Link:
     account: str
     account_name: str
     name: str | None
+    keys: tuple[PersonKey, ...] = ()
 
 
 class Links:
@@ -72,7 +78,14 @@ class Links:
         broken_subjects: set[str] = set()
         broken_accounts: set[str] = set()
         for entry in parsed.links:
-            link = Link(entry.subject, entry.account, entry.accountName, entry.name)
+            keys = tuple(
+                key
+                for key in (
+                    parse_key(k.id, k.alg.value, k.publicKey, k.label) for k in entry.keys or []
+                )
+                if key is not None
+            )
+            link = Link(entry.subject, entry.account, entry.accountName, entry.name, keys)
             # One link per person and one person per account: a file that
             # breaks either rule is the starter's mistake, and the safe
             # reading drops every entry involved rather than choose.

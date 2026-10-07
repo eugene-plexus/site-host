@@ -156,6 +156,8 @@ async def test_a_folder_inside_the_workers_protected_roots_is_refused_though_the
     }
     site.host.policy.add_folder(record)
     site.host.policy.set_folder_people("f1", [{"subject": BO, "writable": False}])
+    # Written behind the site's back, so approved at the machine first (J52).
+    assert (await site.confirm_rules())["status"] == "done"
     read = {"name": "read_text", "arguments": {"folder": "Secret", "path": "node.yaml"}}
     control = await site.mcp(BO, FILES, "tools/call", read)
     assert control["status"] == "done" and "secret" in json.dumps(control["response"]), control

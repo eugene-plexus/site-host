@@ -133,6 +133,7 @@ class Channel:
                             "subject": op.get("subject"),
                             "action": op.get("action"),
                             "arguments": op.get("arguments") or {},
+                            "names": op.get("names") or None,
                         }
                     )
                 )

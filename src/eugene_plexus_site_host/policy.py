@@ -11,10 +11,17 @@ read, or also to change files, which is a standing pre-approval for
 `write_text` (J6g). A local server is off until its owner turns it on, and a
 person has none of its tools until the owner names them; a destructive tool
 is named with `standing: true`, a standing pre-approval, or not at all.
+
+**Approved** (J14a, J52): `authorized` is the digest of the rules as their
+owner last approved them with their own key, at the machine. Rules whose
+digest is not it were changed on the root's word alone, and no tool runs
+until the owner approves them as a whole. Rules that grant nothing need no
+approval.
 """
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 from dataclasses import dataclass, field
@@ -34,6 +41,7 @@ class Policy:
     access: list[dict[str, Any]] = field(default_factory=list)
     enabled: dict[str, bool] = field(default_factory=dict)
     owner_in_dev_mode: bool = False
+    authorized: str | None = None
 
     @classmethod
     def load(cls, path: Path) -> Policy:
@@ -53,6 +61,8 @@ class Policy:
         ]
         policy.enabled = {str(k): bool(v) for k, v in (value.get("enabled") or {}).items()}
         policy.owner_in_dev_mode = bool(value.get("ownerInDevMode"))
+        authorized = value.get("authorized")
+        policy.authorized = authorized if isinstance(authorized, str) else None
         return policy
 
     def save(self) -> None:
@@ -64,6 +74,7 @@ class Policy:
                 "access": self.access,
                 "enabled": self.enabled,
                 "ownerInDevMode": self.owner_in_dev_mode,
+                "authorized": self.authorized,
             },
             ensure_ascii=False,
             indent=2,
@@ -75,6 +86,36 @@ class Policy:
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(temporary, self.path)
+
+    # --- approved by the owner's key (J52) -------------------------------------
+
+    def digest(self) -> str:
+        """SHA-256 over every rule, in a form that does not depend on order of
+        writing: what an owner's key approves as a whole."""
+        rules = {
+            "folders": self.folders,
+            "access": self.access,
+            "enabled": {k: v for k, v in sorted(self.enabled.items()) if v},
+            "ownerInDevMode": self.owner_in_dev_mode,
+        }
+        text = json.dumps(rules, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+        return hashlib.sha256(text.encode()).hexdigest()
+
+    def grants_nothing(self) -> bool:
+        return (
+            not self.folders
+            and not self.access
+            and not any(self.enabled.values())
+            and not self.owner_in_dev_mode
+        )
+
+    def approved(self) -> bool:
+        return self.grants_nothing() or self.authorized == self.digest()
+
+    def authorize(self) -> None:
+        """The rules as they are now are their owner's."""
+        self.authorized = self.digest()
+        self.save()
 
     # --- reads ---------------------------------------------------------------
 

@@ -158,6 +158,9 @@ async def test_a_duplicate_name_from_before_reads_name_2(
     policy.folders[1]["name"] = "Notes"
     policy.save()
     site = await open_site(tmp_path)
+    # Rules written behind the site's back run nothing until approved (J52).
+    assert site.host.signing_state() == "unconfirmed"
+    assert (await site.confirm_rules())["status"] == "done"
     await give(site, one, (BO, False))
     await give(site, two, (BO, False))
     assert listed(await site.mcp(BO, FILES, "tools/list"))["read_text"] == ["Notes", "Notes (2)"]
@@ -376,6 +379,11 @@ async def test_an_edited_policy_file_cannot_make_a_read_only_folder_writable(
     policy.save()
     await first.close()
     site = await open_site(tmp_path)
+    # An edited policy file is not the owner's rules: nothing runs (J52)...
+    refused = await site.mcp(BO, FILES, "tools/list")
+    assert refused["status"] == "failed" and "approved its rules" in refused["message"]
+    # ...and approved as it stands, a reader still cannot write.
+    assert (await site.confirm_rules())["status"] == "done"
     assert "write_text" not in listed(await site.mcp(BO, FILES, "tools/list"))
     refused = await site.mcp(BO, FILES, "tools/call", write("Notes", "x.txt"))
     assert refused["status"] == "failed" and not (folder / "x.txt").exists()

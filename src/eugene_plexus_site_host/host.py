@@ -27,6 +27,14 @@ tools run in the owner's worker too.
 
 A management action is taken from the owner this site recorded at its join,
 and from nobody else, Eugene's owner included (J6b).
+
+**The owner's own key** (J14a, `person-held-keys.md`). Until the owner has a
+key pinned at the machine and has approved the site's rules with it, no tool
+runs here (J48, J52). Once they have, a change that gives access is not
+applied on the root's word: it is **held** until the owner approves it at the
+machine, on the starter's loopback page, which signs the envelope this host
+gives it (`signing.py`); this host checks that signature against the pinned
+key. A change that only takes access away is applied at once (J51).
 """
 
 from __future__ import annotations
@@ -39,14 +47,16 @@ import secrets
 import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from typing import Any
 
 import mcp_types as types
 from pydantic import BaseModel, ValidationError
 
-from . import _build, accounts, dispatch, file_server, folder_io
+from . import _build, accounts, dispatch, file_server, folder_io, signing
 from ._generated.models import (
     SiteAccessSet,
+    SiteApproval,
     SiteAuditRead,
     SiteCall,
     SiteFolderAdd,
@@ -64,6 +74,7 @@ from .links import Link, Links
 from .local_servers import LocalServerError, LocalServers
 from .policy import Policy
 from .settings import Settings
+from .signing import PersonKey
 from .workers import WorkerAbsent, WorkerGone, Workers, WorkerTimeout
 
 PROTOCOL = "mcp-2026-07-28"
@@ -78,6 +89,15 @@ WORKER_SECONDS = 25.0
 
 class Refused(Exception):
     """The site's refusal, in its own words. Nothing ran."""
+
+
+class NotHeld(Exception):
+    """No such person, key or held change here, for the starter's page."""
+
+
+#: The id of the one item that is not a held change: the site's rules as a
+#: whole, approved once the owner has a key (J52).
+RULES = "rules"
 
 
 def is_destructive(tool: types.Tool) -> bool:
@@ -100,6 +120,10 @@ def tool_view(tool: types.Tool) -> dict[str, Any]:
         "readOnly": bool(tool.annotations and tool.annotations.read_only_hint),
         "destructive": is_destructive(tool),
     }
+
+
+def _iso(moment: float) -> str:
+    return datetime.fromtimestamp(moment, UTC).isoformat()
 
 
 def version() -> str:
@@ -134,6 +158,8 @@ class Host:
         self.policy = Policy.load(settings.data_dir / "policy.json")
         self.local = LocalServers(settings.local_servers, settings.data_dir, verify=False)
         self.links = Links(settings.links_file)
+        self.held = signing.HeldStore(settings.data_dir)
+        self.sequence = signing.Sequence(settings.data_dir)
         self.workers = Workers(self.links, settings.channel, None)
         self.lock = asyncio.Lock()
         self.used: dict[str, float] = {}
@@ -270,6 +296,8 @@ class Host:
             except dispatch.NotServed as exc:
                 raise Refused(str(exc)) from None
             if reason := self.settings.unavailable():
+                raise Refused(reason)
+            if reason := self._unapproved():
                 raise Refused(reason)
             target = self._target(call)
             if not target.allowed:
@@ -481,7 +509,17 @@ class Host:
                 )
             handler = self._handlers()[name]
             async with self.lock:
+                changes = name != "audit.read"
+                reduces = changes and self._reduces(name, arguments)
+                if changes and not reduces and self.keys_of(owner):
+                    message = self._hold(action, arguments)
+                    self.audit.record(**entry, decision="allowed", outcome="held", reason=message)
+                    return {"status": "held", "message": message}
+                approved = self.policy.approved()
                 result = await handler(arguments)
+                if reduces and approved and not self.policy.approved():
+                    # Less than the owner approved is still theirs (J51).
+                    self.policy.authorize()
         except Refused as exc:
             self.audit.record(**entry, decision="refused", reason=str(exc))
             return {"status": "failed", "message": str(exc)}
@@ -687,6 +725,418 @@ class Host:
         limit = value.limit or 50
         return {"entries": await asyncio.to_thread(self.audit.newest, limit)}
 
+    # --- the owner's own key (J14a) ------------------------------------------------
+
+    def keys_of(self, subject: str) -> dict[str, PersonKey]:
+        """The keys pinned at the machine to `subject`'s link."""
+        link = self.links.for_subject(subject) if subject != OPERATOR else None
+        return {key.id: key for key in link.keys} if link else {}
+
+    def signing_state(self) -> str:
+        owner = self.identity.owner()
+        if owner is None or not self.keys_of(owner):
+            return "unsigned"
+        return "signed" if self.policy.approved() else "unconfirmed"
+
+    def approve_page(self) -> str | None:
+        page = self.settings.link_page
+        return f"{page.rstrip('/')}/approve" if page else None
+
+    def _at_the_machine(self) -> str:
+        page = self.approve_page()
+        return f"on {self._machine()}, at {page}" if page else f"at {self._machine()} itself"
+
+    def _unapproved(self) -> str | None:
+        """Why no tool runs here yet (J48, J52), or None."""
+        self.links.all()  # the keys are in the links file: its problem first
+        if self.links.problem:
+            return self.links.problem
+        state = self.signing_state()
+        if state == "signed":
+            return None
+        if state == "unsigned":
+            return (
+                f"{self._machine()}'s owner has not added their own key there yet, so no tool "
+                f"runs on it. They add it {self._at_the_machine()}."
+            )
+        return (
+            f"{self._machine()}'s owner has not approved its rules with their key yet, so no "
+            f"tool runs on it. They do it {self._at_the_machine()}."
+        )
+
+    def _reduces(self, name: str, arguments: dict[str, Any]) -> bool:
+        """Whether a change only takes access away (J51): it needs no
+        signature, and less than the owner approved is still theirs."""
+        try:
+            if name == "folder.remove":
+                return True
+            if name == "server.enable":
+                return SiteServerEnable.model_validate(arguments).enabled is False
+            if name == "settings.set":
+                return SiteSettings.model_validate(arguments).ownerInDevMode is False
+            if name == "folder.people":
+                people = SiteFolderPeople.model_validate(arguments)
+                folder = self.policy.folder(people.id)
+                if folder is None:
+                    return False
+                before = {p["subject"]: bool(p["writable"]) for p in folder["people"]}
+                return all(
+                    p.subject in before and (before[p.subject] or not p.writable)
+                    for p in people.people
+                )
+            if name == "access.set":
+                access = SiteAccessSet.model_validate(arguments)
+                server = str(access.server)
+                local = self.local.entries.get(server)
+                known = {t.name: t for t in self.local.known_tools(local)} if local else {}
+                for person in access.people:
+                    before = self.policy.tools_for(person.subject, server)
+                    for grant in person.tools:
+                        if grant.name not in before:
+                            return False
+                        tool = known.get(grant.name)
+                        matters = tool is None or is_destructive(tool)
+                        if matters and grant.standing and not before[grant.name]:
+                            return False
+                return True
+        except ValidationError:
+            return False
+        return False
+
+    def _hold(self, action: SiteManage, arguments: dict[str, Any]) -> str:
+        """Check what can be checked now, then keep the change for its
+        owner's approval at the machine. The message for Workbench."""
+        name = action.action.value
+        self._precheck(name, arguments)
+        subjects = self._named(name, arguments)
+        names = {k: str(v)[:256] for k, v in (action.names or {}).items() if k in subjects}
+        try:
+            self.held.add(action.subject, name, arguments, names)
+        except signing.Full as exc:
+            raise Refused(str(exc)) from None
+        return (
+            f"Waiting for your approval {self._at_the_machine()}. Nothing changes until you "
+            "approve it there with your key."
+        )
+
+    def _precheck(self, name: str, arguments: dict[str, Any]) -> None:
+        """The cheap half of each change's checks, so a change that cannot
+        be applied is refused now rather than held."""
+        if name == "folder.add":
+            value = self._parse(SiteFolderAdd, arguments)
+            folder_name, path = value.name.strip(), value.path.strip()
+            if not folder_name or any(ord(c) < 32 for c in folder_name):
+                raise Refused("Use a folder name without control characters.")
+            if folder_name.casefold() in {n.casefold() for n in self.policy.names().values()}:
+                raise Refused(
+                    f"A folder named {folder_name} is registered already. Choose another name."
+                )
+            if not path or any(ord(c) < 32 for c in path):
+                raise Refused("Use a folder path without control characters.")
+            try:
+                folder_io.check_root_path(path, self.protected)
+            except folder_io.FolderError as exc:
+                raise Refused(str(exc)) from None
+        elif name == "folder.people":
+            people = self._parse(SiteFolderPeople, arguments)
+            folder = self.policy.folder(people.id)
+            if folder is None:
+                raise Refused("This folder is no longer registered.")
+            seen: set[str] = set()
+            for person in people.people:
+                if person.subject == OPERATOR:
+                    raise Refused(
+                        "Eugene's owner is not a person here. Let them in for dev mode in this "
+                        "site's settings instead."
+                    )
+                self._only_owner(person.subject)
+                if person.subject in seen:
+                    raise Refused("Each person is named once.")
+                seen.add(person.subject)
+                if person.writable and not folder["writable"]:
+                    raise Refused(
+                        f"Nobody may change files in {folder['name']}: it was registered read-only."
+                    )
+        elif name == "access.set":
+            access = self._parse(SiteAccessSet, arguments)
+            server = str(access.server)
+            local = self.local.entries.get(server)
+            if server == FILES:
+                raise Refused(
+                    "Folders are given to people one by one, not through the file server."
+                )
+            if local is None:
+                raise Refused("This machine has no such server.")
+            if not self.policy.enabled.get(server):
+                raise Refused(f"Turn {local.name} on before saying who may use it.")
+            for entry in access.people:
+                if entry.subject == OPERATOR:
+                    raise Refused(
+                        "Eugene's owner is not a person here. Let them in for dev mode in this "
+                        "site's settings instead."
+                    )
+                self._only_owner(entry.subject)
+        elif name == "server.enable":
+            enable = self._parse(SiteServerEnable, arguments)
+            local = self.local.entries.get(str(enable.server))
+            if local is None:
+                raise Refused("This machine has no such server.")
+            if problem := self.local.problem(local):
+                raise Refused(problem)
+        elif name == "settings.set":
+            self._parse(SiteSettings, arguments)
+
+    @staticmethod
+    def _named(name: str, arguments: dict[str, Any]) -> set[str]:
+        people = arguments.get("people") if name in ("folder.people", "access.set") else None
+        if not isinstance(people, list):
+            return set()
+        return {str(p.get("subject")) for p in people if isinstance(p, dict)}
+
+    # --- the starter's page: list, approve, turn down -------------------------------
+
+    def held_list(self, subject: str, key: str | None) -> dict[str, Any]:
+        """What `subject` has waiting, for the page at the machine; with one
+        of their keys, each with the envelope to sign."""
+        keys = self.keys_of(subject)
+        if self.links.for_subject(subject) is None or (key is not None and key not in keys):
+            raise NotHeld(subject)
+        enrollment = self.identity.load()
+        owner = self.identity.owner()
+        seq = self.sequence.last(subject) + 1
+
+        def envelope(act: str, args: dict[str, Any]) -> str | None:
+            if key is None or enrollment is None:
+                return None
+            return signing.envelope(
+                site=enrollment.site,
+                enrolled_at=enrollment.enrolledAt,
+                person=subject,
+                key=key,
+                act=act,
+                args=args,
+                seq=seq,
+            )
+
+        items: list[dict[str, Any]] = []
+        if subject == owner and keys and not self.policy.approved():
+            items.append(
+                {
+                    "id": RULES,
+                    "action": signing.CONFIRM,
+                    "words": self._rules_words(),
+                    "heldAt": None,
+                    "envelope": envelope(signing.CONFIRM, {"digest": self.policy.digest()}),
+                }
+            )
+        for held in self.held.for_subject(subject):
+            items.append(
+                {
+                    "id": held.id,
+                    "action": held.action,
+                    "words": self._words(held),
+                    "heldAt": _iso(held.held_at),
+                    "expiresAt": _iso(held.expires_at),
+                    "envelope": envelope(held.action, held.arguments),
+                }
+            )
+        return {
+            "subject": subject,
+            "keys": sorted(keys),
+            "state": self.signing_state() if subject == owner else None,
+            "items": items,
+        }
+
+    async def approve(self, ident: str, approval: SiteApproval) -> dict[str, Any]:
+        """Apply a held change (or the rules as a whole) once its person's
+        key has signed it at the machine."""
+        subject = approval.subject
+        if self.links.for_subject(subject) is None:
+            raise NotHeld(subject)
+        owner = self.identity.owner()
+        held = None if ident == RULES else self.held.get(ident)
+        if ident == RULES:
+            if subject != owner:
+                raise NotHeld(ident)
+            act, args = signing.CONFIRM, {"digest": self.policy.digest()}
+        elif held is None or held.subject != subject:
+            raise NotHeld(ident)
+        else:
+            act, args = held.action, held.arguments
+        entry = {"subject": subject, "kind": "manage", "action": act, "arguments": args}
+        async with self.lock:
+            try:
+                enrollment = self.identity.load()
+                if enrollment is None or subject != owner:
+                    raise Refused("Only this machine's owner changes what it allows.")
+                if ident == RULES:
+                    # The rules as they are now, not as they were when listed.
+                    args = {"digest": self.policy.digest()}
+                try:
+                    checked = signing.check(
+                        approval.envelope,
+                        approval.signature,
+                        site=enrollment.site,
+                        enrolled_at=enrollment.enrolledAt,
+                        person=subject,
+                        act=act,
+                        args=args,
+                        keys=self.keys_of(subject),
+                        key=approval.key,
+                        last_seq=self.sequence.last(subject),
+                    )
+                    # Spent before it is applied: one signature, one try.
+                    self.sequence.accept(subject, checked.seq)
+                except signing.NotSigned as exc:
+                    raise Refused(str(exc)) from None
+                result: dict[str, Any] = {}
+                if ident == RULES:
+                    self.policy.authorize()
+                else:
+                    approved = self.policy.approved()
+                    result = await self._handlers()[act](args)
+                    self.held.remove(ident)
+                    if approved:
+                        self.policy.authorize()
+            except Refused as exc:
+                self.audit.record(**entry, decision="refused", reason=str(exc))
+                return {"status": "failed", "message": str(exc)}
+        self.audit.record(
+            **entry,
+            decision="allowed",
+            outcome="done",
+            reason=f"Approved at the machine with key {checked.key.id[:8]}.",
+        )
+        return {"status": "done", "result": result}
+
+    def reject(self, ident: str, subject: str) -> None:
+        held = self.held.get(ident)
+        if held is None or held.subject != subject:
+            raise NotHeld(ident)
+        self.held.remove(ident)
+        self.audit.record(
+            subject=subject,
+            kind="manage",
+            action=held.action,
+            arguments=held.arguments,
+            decision="refused",
+            reason="Turned down at the machine.",
+        )
+
+    # --- a change in this site's own words ------------------------------------------
+
+    def _who(self, subject: str, names: dict[str, str]) -> str:
+        if subject == self.identity.owner():
+            return "you"
+        link = self.links.for_subject(subject)
+        if link is not None:
+            return f"{link.name or subject} ({link.account_name} on this machine)"
+        name = names.get(subject)
+        if name:
+            return f"{name} (as Eugene names them; no account on this machine)"
+        return f"a person with no account on this machine (Eugene id {subject})"
+
+    def _server_name(self, server: str) -> str:
+        local = self.local.entries.get(server)
+        return local.name if local else server
+
+    def _words(self, held: signing.Held) -> list[str]:
+        args, names = held.arguments, held.names
+        try:
+            if held.action == "folder.add":
+                add = SiteFolderAdd.model_validate(args)
+                return [
+                    f"Add the folder {add.path.strip()} as “{add.name.strip()}”.",
+                    "People you allow may change files in it."
+                    if add.writable
+                    else "It is read only: nobody may change files in it.",
+                    "Nobody may use it until you say who.",
+                ]
+            if held.action == "folder.people":
+                return self._people_words(SiteFolderPeople.model_validate(args), names)
+            if held.action == "access.set":
+                access = SiteAccessSet.model_validate(args)
+                lines = [f"Who may use {self._server_name(str(access.server))}'s tools:"]
+                for person in access.people:
+                    tools = ", ".join(
+                        t.name + (" (pre-approved: may change things)" if t.standing else "")
+                        for t in person.tools
+                    )
+                    lines.append(f"• {self._who(person.subject, names)}: {tools or 'none'}")
+                if not access.people:
+                    lines.append("• nobody")
+                return lines
+            if held.action == "server.enable":
+                enable = SiteServerEnable.model_validate(args)
+                local = self.local.entries.get(str(enable.server))
+                program = (
+                    f": {' '.join([local.command, *(a.root for a in local.args or [])])}"
+                    if local
+                    else ""
+                )
+                return [
+                    f"Turn on {self._server_name(str(enable.server))}.",
+                    f"Its program runs as you to list its tools{program}.",
+                    "Nobody may use it until you say who.",
+                ]
+            if held.action == "settings.set":
+                return [
+                    "Let Eugene's owner use the folders they give themselves here, while "
+                    "Eugene is in dev mode."
+                ]
+        except ValidationError:
+            pass
+        return [f"{held.action}: {signing.canonical(args)[:900]}"]
+
+    def _people_words(self, people: SiteFolderPeople, names: dict[str, str]) -> list[str]:
+        folder = self.policy.folder(people.id)
+        label = f"“{folder['name']}” ({folder['path']})" if folder else "a folder"
+        before = {p["subject"]: p["writable"] for p in (folder or {}).get("people", [])}
+        lines = [f"Who may use {label}:"]
+        for person in people.people:
+            what = "read and change files" if person.writable else "read"
+            if person.subject not in before:
+                what += " (new)"
+            elif person.writable and not before[person.subject]:
+                what += " (now also changes files)"
+            lines.append(f"• {self._who(person.subject, names)}: {what}")
+        kept = {p.subject for p in people.people}
+        lines += [f"• no longer: {self._who(s, names)}" for s in before if s not in kept]
+        if not people.people:
+            lines.append("• nobody")
+        return lines
+
+    def _rules_words(self) -> list[str]:
+        lines = ["Keep this machine's rules as they are now:"]
+        none: dict[str, str] = {}
+        if not self.policy.folders:
+            lines.append("• No folders.")
+        for folder in self.policy.folders:
+            mode = "files may be changed" if folder["writable"] else "read only"
+            people = "; ".join(
+                f"{self._who(p['subject'], none)} "
+                f"({'read and change files' if p['writable'] else 'read'})"
+                for p in folder["people"]
+            )
+            lines.append(
+                f"• Folder “{folder['name']}” ({folder['path']}), {mode}: {people or 'nobody'}."
+            )
+        for server, on in sorted(self.policy.enabled.items()):
+            if not on:
+                continue
+            people = "; ".join(
+                f"{self._who(e['subject'], none)}: {', '.join(t['name'] for t in e['tools'])}"
+                for e in self.policy.access
+                if e["server"] == server
+            )
+            lines.append(f"• {self._server_name(server)} is on: {people or 'nobody may use it'}.")
+        lines.append(
+            "• Eugene's owner may use the folders they give themselves here, in dev mode."
+            if self.policy.owner_in_dev_mode
+            else "• Eugene's owner is not let in."
+        )
+        return lines
+
     # --- report -----------------------------------------------------------------
 
     def reason(self) -> str | None:
@@ -756,6 +1206,7 @@ class Host:
                     "accountName": link.account_name,
                     "available": available,
                     "reason": None if available else self._not_running(link, own=True),
+                    "keys": len(link.keys),
                 }
             )
         return views
@@ -783,6 +1234,11 @@ class Host:
             "links": self._links_view(),
             "linkPage": self.settings.link_page,
             "sharing": self.settings.sharing,
+            "signing": {
+                "state": self.signing_state(),
+                "held": len(self.held.all()),
+                "approvePage": self.approve_page(),
+            },
         }
 
     def _refresh_stale(self) -> None:

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import contextlib
 import hashlib
 import json
@@ -15,9 +16,16 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
-from eugene_plexus_site_host import local_channel
-from eugene_plexus_site_host._generated.models import SiteCall, SiteLocalServer, SiteManage
+from eugene_plexus_site_host import local_channel, signing
+from eugene_plexus_site_host._generated.models import (
+    SiteApproval,
+    SiteCall,
+    SiteLocalServer,
+    SiteManage,
+)
 from eugene_plexus_site_host.host import Host
 from eugene_plexus_site_host.identity import Enrollment, Identity
 from eugene_plexus_site_host.settings import Settings
@@ -79,17 +87,47 @@ def drop_channel(channel: str) -> None:
         shutil.rmtree(Path(channel).parent, ignore_errors=True)
 
 
-def link_entry(subject: str, account: str, name: str = "person") -> dict[str, str]:
-    return {
+class PersonKey:
+    """A person's key as their browser holds it at the machine (J14a): the
+    private half stays here; `entry` is what the starter pins."""
+
+    def __init__(self, label: str = "Chrome on desk") -> None:
+        self.private = Ed25519PrivateKey.generate()
+        self.raw = self.private.public_key().public_bytes(
+            serialization.Encoding.Raw, serialization.PublicFormat.Raw
+        )
+        self.id = signing.key_id(self.raw)
+        self.label = label
+
+    def entry(self) -> dict[str, Any]:
+        return {
+            "id": self.id,
+            "alg": "Ed25519",
+            "publicKey": base64.b64encode(self.raw).decode(),
+            "label": self.label,
+            "addedAt": "2026-10-06T12:00:00Z",
+        }
+
+    def sign(self, text: str) -> str:
+        return base64.b64encode(self.private.sign(text.encode("utf-8"))).decode()
+
+
+def link_entry(
+    subject: str, account: str, name: str = "person", keys: list[PersonKey] | None = None
+) -> dict[str, Any]:
+    entry: dict[str, Any] = {
         "subject": subject,
         "name": name,
         "account": account,
         "accountName": "HOST/" + name,
         "linkedAt": "2026-10-06T12:00:00Z",
     }
+    if keys:
+        entry["keys"] = [key.entry() for key in keys]
+    return entry
 
 
-def write_links(path: Path, *entries: dict[str, str]) -> None:
+def write_links(path: Path, *entries: dict[str, Any]) -> None:
     path.write_text(json.dumps({"version": 1, "links": list(entries)}), encoding="utf-8")
 
 
@@ -107,8 +145,10 @@ class Site:
     a real channel. Eugene's owner `ADA` is linked to that account; anyone
     else is served by the owner's worker (J27)."""
 
-    def __init__(self, host: Host) -> None:
+    def __init__(self, host: Host, key: PersonKey | None = None) -> None:
         self.host = host
+        self.key = key
+        """The owner's key, pinned with their link; None for an unsigned site."""
         self.worker: Worker | None = None
         self.task: asyncio.Task[None] | None = None
         self.closed = False
@@ -181,8 +221,19 @@ class Site:
         )
         return await self.host.mcp(call)
 
-    async def manage(self, subject: str, action: str, **arguments: Any) -> dict[str, Any]:
-        return await self.host.manage(
+    async def manage(
+        self,
+        subject: str,
+        action: str,
+        *,
+        approve: bool = True,
+        names: dict[str, str] | None = None,
+        **arguments: Any,
+    ) -> dict[str, Any]:
+        """A management action from the root. A change the site holds is
+        approved at once with the owner's key, as the owner would at the
+        machine, unless `approve` is False."""
+        answer = await self.host.manage(
             SiteManage.model_validate(
                 {
                     "id": secrets.token_hex(8),
@@ -190,9 +241,35 @@ class Site:
                     "subject": subject,
                     "action": action,
                     "arguments": arguments,
+                    "names": names,
                 }
             )
         )
+        if answer.get("status") != "held" or not approve:
+            return answer
+        held = [h for h in self.host.held.for_subject(subject) if h.action == action]
+        assert held, answer
+        return await self.approve(held[-1].id, subject)
+
+    async def approve(self, ident: str, subject: str = ADA, key: PersonKey | None = None) -> Any:
+        """Sign one listed item at the machine with `key` (the owner's)."""
+        key = key or self.key
+        assert key is not None, "this site's owner has no key"
+        listed = self.host.held_list(subject, key.id)
+        item = next(i for i in listed["items"] if i["id"] == ident)
+        return await self.host.approve(
+            ident,
+            SiteApproval(
+                subject=subject,
+                envelope=item["envelope"],
+                key=key.id,
+                signature=key.sign(item["envelope"]),
+            ),
+        )
+
+    async def confirm_rules(self) -> Any:
+        """The owner approves the site's rules as a whole (J52)."""
+        return await self.approve("rules")
 
 
 ENROLLMENT = Enrollment(
@@ -246,16 +323,24 @@ OpenSite = Callable[..., Awaitable[Site]]
 @pytest.fixture
 async def open_site(tmp_path: Path) -> AsyncIterator[OpenSite]:
     """`await open_site(path, **settings)`: a started host with its owner
-    linked to this process's account and that account's worker connected."""
+    linked to this process's account, with a key pinned (J14a; `signed=False`
+    for none), and that account's worker connected."""
     opened: list[Site] = []
+    keys: dict[Path, PersonKey] = {}
 
-    async def make(path: Path | None = None, *, worker: bool = True, **overrides: Any) -> Site:
+    async def make(
+        path: Path | None = None, *, worker: bool = True, signed: bool = True, **overrides: Any
+    ) -> Site:
         where = path or tmp_path
         settings = settings_for(where, **overrides)
         assert settings.links_file is not None
+        key = keys.setdefault(where, PersonKey()) if signed else None
         if not settings.links_file.exists():
-            write_links(settings.links_file, link_entry(ADA, local_channel.own_account(), "ada"))
-        made = Site(Host(settings))
+            write_links(
+                settings.links_file,
+                link_entry(ADA, local_channel.own_account(), "ada", [key] if key else None),
+            )
+        made = Site(Host(settings), key)
         opened.append(made)
         await made.host.start()
         assert made.host.workers.problem is None, made.host.workers.problem
