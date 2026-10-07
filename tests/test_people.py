@@ -631,3 +631,17 @@ async def test_deny_on_reading_is_not_offered_where_changing_is(
     assert enum(listed, "read_text") == ["Notes"] and enum(listed, "write_text") == ["Mine"]
     refused = await call(site, BO, "read_text", folder="Mine", path="plan.txt")
     assert refused["status"] == "failed" and "may not read or search" in refused["message"]
+
+
+async def test_with_nothing_offered_a_person_without_a_key_is_told_to_add_one(
+    open_site: OpenSite, tmp_path: Path
+) -> None:
+    """J48 says why no tool runs: before a first workspace, a linked person
+    with no key is told to add one, not that they have no workspace."""
+    site = await open_site(tmp_path, signed=False)
+    refused = await site.mcp(ADA, FILES, "tools/list")
+    assert refused["status"] == "failed" and "own key" in refused["message"], refused
+    at_bo = await open_site(tmp_path / "bo")
+    at(at_bo, BO, [PersonKey()])
+    keyed = await at_bo.mcp(BO, FILES, "tools/list")
+    assert keyed["status"] == "failed" and "no workspace" in keyed["message"], keyed

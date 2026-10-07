@@ -446,7 +446,15 @@ class Host:
             if not target.allowed:
                 if target.blocked:
                     raise Refused(next(iter(target.blocked.values()))[0])
-                raise Refused(self._not_listed(target, call.subject))
+                # With nothing offered, a person with no key yet (or rules not
+                # yet approved) is told that first: it is what to do next, and
+                # no tool runs here until it is done (J48, per person).
+                own = (
+                    self._unapproved(call.subject, call.subject)
+                    if call.subject != OPERATOR and self.links.for_subject(call.subject)
+                    else None
+                )
+                raise Refused(own or self._not_listed(target, call.subject))
             account = self._route(call.subject)
             if target.work["kind"] == "local":
                 target.tools = await self._local_tools(target.id, account)
