@@ -60,12 +60,17 @@ def listed(answer: dict[str, Any]) -> dict[str, list[str]]:
     }
 
 
-async def test_nobody_has_anything_until_the_owner_says(site: Site, folder: Path) -> None:
+async def test_nobody_but_its_holder_has_a_workspace_until_it_is_shared(
+    site: Site, folder: Path
+) -> None:
+    """2b.3b (J69): the owner's folder is their workspace, theirs to read
+    at once (§2.6); nobody else has it until the owner shares it."""
     await add(site, folder)
-    for subject in (ADA, BO):
-        refused = await site.mcp(subject, FILES, "tools/call", read())
-        assert refused["status"] == "failed" and "has not given you" in refused["message"]
-        assert (await site.mcp(subject, FILES, "tools/list"))["status"] == "failed"
+    refused = await site.mcp(BO, FILES, "tools/call", read())
+    assert refused["status"] == "failed" and "has not given you" in refused["message"]
+    assert (await site.mcp(BO, FILES, "tools/list"))["status"] == "failed"
+    mine = await site.mcp(ADA, FILES, "tools/call", read())
+    assert mine["status"] == "done" and "Notes from ada's desk" in text(mine)
 
 
 async def test_the_folder_argument_lists_only_what_was_granted(
@@ -86,7 +91,7 @@ async def test_the_folder_argument_lists_only_what_was_granted(
     got = await site.mcp(BO, FILES, "tools/call", read())
     assert got["status"] == "done" and "Notes from ada's desk" in text(got)
     refused = await site.mcp(BO, FILES, "tools/call", read("Private"))
-    assert refused["status"] == "failed" and "folder named 'Private'" in refused["message"]
+    assert refused["status"] == "failed" and "workspace named 'Private'" in refused["message"]
     unnamed = await site.mcp(
         BO, FILES, "tools/call", {"name": "read_text", "arguments": {"path": "note.txt"}}
     )
@@ -146,7 +151,7 @@ async def test_a_folder_name_is_unique_on_the_machine(
     other.mkdir()
     await add(site, folder)
     again = await site.manage(ADA, "folder.add", name="notes", path=str(other))
-    assert again["status"] == "failed" and "registered already" in again["message"]
+    assert again["status"] == "failed" and "named notes already" in again["message"]
 
 
 async def test_a_duplicate_name_from_before_reads_name_2(
@@ -171,8 +176,9 @@ async def test_a_duplicate_name_from_before_reads_name_2(
     assert listed(await site.mcp(BO, FILES, "tools/list"))["read_text"] == ["Notes", "Notes (2)"]
     got = await site.mcp(BO, FILES, "tools/call", read("Notes (2)"))
     assert got["status"] == "done" and "the second" in text(got)
-    names = [f["name"] for f in site.host.summary()["folders"]]
-    assert names == ["Notes", "Notes (2)"]
+    # The report carries each holder's own names; each view names its own.
+    names = [w["name"] for w in site.host.summary()["workspaces"]]  # type: ignore[index]
+    assert names == ["Notes", "Notes"]
 
 
 async def test_an_owner_named_in_the_environment_is_not_the_owner(
@@ -215,7 +221,7 @@ async def test_the_list_survives_a_restart_and_is_the_sites_own_file(
     await first.close()
     again = await open_site(tmp_path)
     assert (await again.mcp(BO, FILES, "tools/call", read()))["status"] == "done"
-    policy = Policy.load(tmp_path / "data" / "policy.json")
+    policy = Policy.load(tmp_path / "data" / "policy.json", ADA)
     assert [(f["name"], w) for f, w in policy.folders_for(BO)] == [("Notes", False)]
 
 
@@ -250,7 +256,9 @@ async def test_eugenes_owner_needs_dev_mode_a_grant_and_the_sites_say_so(
     assert production["status"] == "failed" and "production" in production["message"]
     no_grant = await site.mcp("operator", FILES, "tools/call", read(), mode="dev")
     assert no_grant["status"] == "failed"
-    forged = [{**grants[0], "identity": "0:0:0"}]
+    # A grant names a workspace by id alone (J76): one that is not the
+    # owner's opens nothing, whatever path or identity it carries.
+    forged = [{**grants[0], "folderId": "0" * 32}]
     assert (await site.mcp("operator", FILES, "tools/call", read(), grants=forged, mode="dev"))[
         "status"
     ] == "failed"
@@ -284,11 +292,14 @@ async def test_the_audit_log_records_decisions_and_never_contents(site: Site, fo
     notes = await add(site, folder, writable=True)
     await give(site, notes, (BO, True))
     await site.mcp(BO, FILES, "tools/call", write("Notes", "s.txt", "SECRET"))
-    await site.mcp(ADA, FILES, "tools/call", read("Notes", "s.txt"))
+    await site.mcp(ADA, FILES, "tools/call", write("Notes", "t.txt", "SECRET"))
     page = await site.manage(ADA, "audit.read", limit=10)
     entries = page["result"]["entries"]
+    # The holder is asked before changing files (§2.6): unasked, refused.
     assert entries[0]["subject"] == ADA and entries[0]["decision"] == "refused"
+    assert entries[0]["rule"] == "ask" and entries[0]["asked"] is False
     assert entries[1]["subject"] == BO and entries[1]["decision"] == "allowed"
+    assert entries[1]["rule"] == "allow" and "reader" not in entries[1]
     assert entries[1]["tool"] == "write_text" and "SECRET" not in json.dumps(entries)
     assert "Notes" in entries[1]["arguments"]
     assert (await site.manage(BO, "audit.read"))["status"] == "failed"
@@ -332,19 +343,28 @@ async def test_the_report_is_the_sites_own_list(site: Site, folder: Path) -> Non
     summary = site.host.summary()
     assert summary is not None
     assert summary["owner"] == ADA and summary["ownerInDevMode"] is False
-    assert summary["folders"] == [
+    # By id and name, never path (J76).
+    assert summary["workspaces"] == [
         {
             "id": notes,
             "name": "Notes",
-            "path": str(folder),
-            "identity": site.host.policy.folder(notes)["identity"],  # type: ignore[union-attr]
+            "holder": ADA,
             "writable": False,
-            "people": [{"subject": BO, "writable": False}],
+            "rules": {"read": "allow", "change": "deny"},
+            "people": [{"subject": BO, "read": "allow", "change": "deny"}],
         }
     ]
+    assert "folders" not in summary and str(folder) not in json.dumps(summary)
     files = summary["servers"][0]
     assert files["id"] == FILES and files["kind"] == "files" and files["enabled"] is True
-    assert [t["name"] for t in files["tools"]] == ["list_directory", "read_text", "glob", "grep"]
+    assert [t["name"] for t in files["tools"]] == [
+        "list_directory",
+        "read_text",
+        "write_text",
+        "edit_text",
+        "glob",
+        "grep",
+    ]
     assert summary["access"] == []
 
 
@@ -380,7 +400,7 @@ async def test_an_edited_policy_file_cannot_make_a_read_only_folder_writable(
     notes = await add(first, folder, writable=False)
     await give(first, notes, (BO, False))
     policy = Policy.load(tmp_path / "data" / "policy.json")
-    policy.folders[0]["people"][0]["writable"] = True
+    policy.folders[0]["people"][0]["rules"]["write_text"] = "allow"
     policy.save()
     await first.close()
     site = await open_site(tmp_path)

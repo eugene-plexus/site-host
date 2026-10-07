@@ -208,7 +208,7 @@ async def test_an_unsigned_site_says_so_and_runs_nothing(open_site: OpenSite, fo
     assert (await people(site, notes, (ADA, False)))["status"] == "done"
     refused = await site.mcp(ADA, FILES, "tools/call", read())
     assert refused["status"] == "failed"
-    assert "not added their own key" in refused["message"]
+    assert "not added your own key" in refused["message"]
     assert "http://127.0.0.1:8079/link/approve" in refused["message"]
     summary = site.host.summary()
     assert summary is not None and summary["signing"]["state"] == "unsigned"
@@ -233,7 +233,7 @@ async def test_a_per_user_site_names_its_approve_page_with_no_link_page(
 async def test_a_change_that_gives_access_is_held_until_signed(site: Site, folder: Path) -> None:
     notes = await added(site, folder)
     held = await people(site, notes, (BO, False), approve=False)
-    assert held["status"] == "held" and "approve it there with your key" in held["message"]
+    assert held["status"] == "held" and "approve it with your key" in held["message"]
     # Nothing changed on the root's word alone.
     assert site.host.policy.folders_for(BO) == []
     refused = await site.mcp(BO, FILES, "tools/call", read())
@@ -336,11 +336,13 @@ async def test_rules_from_before_the_key_are_approved_as_a_whole(
     pins(site, key)
     assert site.host.signing_state() == "unconfirmed"
     refused = await site.mcp(ADA, FILES, "tools/call", read())
-    assert refused["status"] == "failed" and "approved its rules" in refused["message"]
+    assert refused["status"] == "failed" and "approved your rules" in refused["message"]
     listed = site.host.held_list(ADA, key.id)
     rules = listed["items"][0]
     assert rules["id"] == RULES and rules["action"] == "rules.confirm"
-    assert any("Folder “Notes”" in line and "you (read)" in line for line in rules["words"])
+    assert any(
+        "Workspace “Notes”" in line and "read and search: allow" in line for line in rules["words"]
+    )
     # The rules changed after they were listed: that approval is for other rules.
     stale_text = rules["envelope"]
     assert (await site.manage(ADA, "folder.people", id=notes, people=[], approve=False))[
@@ -353,8 +355,8 @@ async def test_rules_from_before_the_key_are_approved_as_a_whole(
     assert refused["status"] == "failed" and "args differs" in refused["message"]
     # A signed change does not approve the rest of the rules: only they as a
     # whole are. (Rules that grant nothing need no approval.)
-    assert (await people(site, notes, (ADA, False), approve=False))["status"] == "held"
-    assert (await people(site, notes, (ADA, False), (BO, False)))["status"] == "done"
+    assert (await people(site, notes, (BO, False), approve=False))["status"] == "held"
+    assert (await people(site, notes, (BO, False)))["status"] == "done"
     assert site.host.signing_state() == "unconfirmed"
     assert (await site.confirm_rules())["status"] == "done"
     assert site.host.signing_state() == "signed"
@@ -390,8 +392,11 @@ async def test_held_changes_are_kept_once_named_and_turned_down_at_the_machine(
     assert site.host.summary()["signing"]["held"] == 1  # type: ignore[index]
     listed = site.host.held_list(ADA, None)
     words = next(i for i in listed["items"] if i["id"] == item.id)["words"]
-    assert words[0].startswith("Who may use “Notes”")
-    assert "Bo Bailey (as Eugene names them; no account on this machine): read (new)" in words[1]
+    assert words[0].startswith("Whom you share “Notes”")
+    assert (
+        "Bo Bailey (as Eugene names them; no account on this machine): read and search: allow; "
+        "change files: deny (new)"
+    ) in words[1]
     assert next(i for i in listed["items"] if i["id"] == item.id)["envelope"] is None
     # Only the person it is held for sees or decides it.
     with pytest.raises(Exception):  # noqa: B017
@@ -550,9 +555,9 @@ async def test_two_approvals_of_one_change_apply_it_once(site: Site, folder: Pat
     assert second != first["envelope"]
     apply = site.host._folder_people
 
-    async def slowly(arguments: dict[str, Any]) -> dict[str, Any]:
+    async def slowly(subject: str, arguments: dict[str, Any]) -> dict[str, Any]:
         await asyncio.sleep(0.05)
-        return await apply(arguments)
+        return await apply(subject, arguments)
 
     site.host._folder_people = slowly  # type: ignore[method-assign]
     answers = await asyncio.gather(

@@ -7,10 +7,11 @@
 - `leave`: tell the root this site is leaving, and forget its enrollment.
 - `check-person`: who a person is, from their Eugene sign-in typed at the
   machine (J36), for root to link them on a Linux system install.
-- `pair`: show a code for pairing the owner's passkey from Workbench, and
-  wait for it (J14a.3). A Linux system install has no page at the machine,
-  so this is where its code is shown. `passkeys` lists and removes them.
-  Both ask the running host on loopback, with the token in its directory.
+- `pair`: show a code for pairing a linked person's passkey from Workbench
+  (the owner's unless `--person` names another, J67), and wait for it
+  (J14a.3). A Linux system install has no page at the machine, so this is
+  where its code is shown. `passkeys` lists and removes them. Both ask the
+  running host on loopback, with the token in its directory.
 
 `--data-dir` defaults to `EUGENE_PLEXUS_APP_DATA_DIR`, the directory the
 agent gave this app.
@@ -38,6 +39,7 @@ from .channel import Channel
 from .host import Host, version
 from .identity import Identity
 from .join import JoinError, join
+from .links import Links
 from .settings import Settings, SettingsError, from_environment
 
 
@@ -142,7 +144,26 @@ def _starter(args: argparse.Namespace) -> tuple[httpx.Client, str, Any]:
     client = sync_client_for(
         url, base_url=url, headers={"Authorization": f"Bearer {token}"}, timeout=10
     )
-    return client, args.subject or enrollment.owner, enrollment
+    return client, args.subject or _person(args) or enrollment.owner, enrollment
+
+
+def _person(args: argparse.Namespace) -> str | None:
+    """The person `--person` names, by the name they are linked under here,
+    from the links file (`SITE_HOST_LINKS_FILE`)."""
+    name = getattr(args, "person", None)
+    if not name:
+        return None
+    path = os.environ.get("SITE_HOST_LINKS_FILE")
+    if not path:
+        sys.exit("eugene-plexus-site-host: --person needs SITE_HOST_LINKS_FILE, the links file")
+    found = [
+        link.subject
+        for link in Links(Path(path)).all()
+        if name.casefold() in {str(link.name or "").casefold(), link.account_name.casefold()}
+    ]
+    if len(found) != 1:
+        sys.exit(f"eugene-plexus-site-host: nobody is linked here as {name}")
+    return found[0]
 
 
 def _ask(client: httpx.Client, method: str, path: str, **kwargs: Any) -> httpx.Response:
@@ -168,18 +189,15 @@ def _pair(args: argparse.Namespace) -> None:
         before = _ask(client, "GET", "/v1/passkeys", params={"subject": subject})
         if before.status_code != 200:
             sys.exit(
-                f"eugene-plexus-site-host: {enrollment.ownerName} is not linked to an account "
-                "here. Link them first (--site-link)."
+                "eugene-plexus-site-host: that person is not linked to an account here. "
+                "Link them first (--site-link)."
             )
         known = {p["id"] for p in before.json().get("passkeys", [])}
         made = _ask(client, "POST", "/v1/passkeys/code", json={"subject": subject})
         if made.status_code != 200:
-            sys.exit(
-                f"eugene-plexus-site-host: only this site's owner, {enrollment.ownerName}, "
-                "pairs a passkey here."
-            )
+            sys.exit("eugene-plexus-site-host: that person is not linked to an account here.")
         code = made.json()
-        print(f"Pair {enrollment.ownerName}'s passkey with {enrollment.label}:")
+        print(f"Pair a passkey with {enrollment.label}:")
         print(f"  1. In Workbench, at its https address, open Job sites, then {enrollment.label}.")
         print("  2. Choose Add a passkey, and type this code there:")
         print()
@@ -200,13 +218,13 @@ def _pair(args: argparse.Namespace) -> None:
                 time.sleep(2)
                 now = _ask(client, "GET", "/v1/passkeys", params={"subject": subject})
                 if now.status_code != 200:
-                    sys.exit("eugene-plexus-site-host: the owner's link went away while waiting")
+                    sys.exit("eugene-plexus-site-host: the person's link went away while waiting")
                 listed = now.json()
                 fresh = [p for p in listed.get("passkeys", []) if p["id"] not in known]
                 if fresh:
                     key = fresh[0]
                     print(f"Paired: {key['label']} ({key['id'][:8]}), for {key['rpId']}.")
-                    print("Next, in Workbench, approve this machine's rules with it.")
+                    print("Next, in Workbench, approve what waits for you with it.")
                     return
                 if listed.get("codeExpiresAt") is None:
                     sys.exit(
@@ -219,7 +237,7 @@ def _pair(args: argparse.Namespace) -> None:
 
 
 def _passkeys(args: argparse.Namespace) -> None:
-    client, subject, enrollment = _starter(args)
+    client, subject, _enrollment = _starter(args)
     with client:
         if args.remove:
             gone = _ask(
@@ -231,10 +249,10 @@ def _passkeys(args: argparse.Namespace) -> None:
             return
         listed = _ask(client, "GET", "/v1/passkeys", params={"subject": subject})
         if listed.status_code != 200:
-            sys.exit(f"eugene-plexus-site-host: {enrollment.ownerName} is not linked here")
+            sys.exit("eugene-plexus-site-host: that person is not linked here")
         keys = listed.json().get("passkeys", [])
         if not keys:
-            print(f"No passkeys are pinned to {enrollment.ownerName} here.")
+            print("No passkeys are pinned to them here.")
         for key in keys:
             print(f"{key['id']}  {key['label']}  ({key['rpId']}, added {key['addedAt'][:10]})")
 
@@ -255,15 +273,17 @@ def main(argv: list[str] | None = None) -> None:
     joining.add_argument("--data-dir", dest="data_dir")
     leaving = commands.add_parser("leave", help="leave the install")
     leaving.add_argument("--data-dir", dest="data_dir")
-    pairing = commands.add_parser("pair", help="a code for pairing the owner's passkey")
+    pairing = commands.add_parser("pair", help="a code for pairing a linked person's passkey")
     pairing.add_argument("--data-dir", dest="data_dir")
     pairing.add_argument("--port", help="the port the running site host listens on")
     pairing.add_argument("--subject", help=argparse.SUPPRESS)
+    pairing.add_argument("--person", help="who, by the name they are linked under (the owner)")
     pairing.add_argument("--no-wait", dest="no_wait", action="store_true")
-    listing = commands.add_parser("passkeys", help="the owner's passkeys pinned here")
+    listing = commands.add_parser("passkeys", help="a linked person's passkeys pinned here")
     listing.add_argument("--data-dir", dest="data_dir")
     listing.add_argument("--port", help="the port the running site host listens on")
     listing.add_argument("--subject", help=argparse.SUPPRESS)
+    listing.add_argument("--person", help="who, by the name they are linked under (the owner)")
     listing.add_argument("--remove", metavar="ID", help="remove this passkey")
     args = parser.parse_args(argv)
     if args.command == "check-person":

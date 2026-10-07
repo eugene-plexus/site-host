@@ -6,6 +6,11 @@ reparse points and holding parents against rename. Only regular, singly
 linked files are used. No shell and no automatic retries. The one traversal,
 a search's walk (`workspace_tools`), opens one name at a time on the same
 handles, follows no link, enters no other mount and stops at a budget.
+
+**Hidden paths** (2b.3b, J70): a workspace's deny patterns, in `.gitignore`'s
+syntax without `!`, hide what they match from every tool. A listing or a
+search leaves it out; a tool that names it is refused before anything is
+opened, so the refusal is the same whether or not it exists.
 """
 
 from __future__ import annotations
@@ -20,6 +25,8 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+
+import pathspec
 
 MAX_BYTES = 32_768
 MAX_CHARACTERS = 16_384
@@ -36,6 +43,55 @@ class FolderError(Exception):
 
 class WriteUncertain(FolderError):
     """A write began but its completion could not be established."""
+
+
+HIDDEN = "This path is hidden in this workspace."
+#: An 8.3 short name (`SECRET~1.TXT`): Windows opens it as the long name it
+#: stands for, so a hidden long name could be reached through it.
+_SHORT_NAME = re.compile(r"[^.~]{1,6}~[0-9]{1,6}(?:\.[^.]{1,3})?")
+_CASELESS = sys.platform == "win32"
+
+
+class Hidden:
+    """A workspace's deny patterns (J70), matched as git matches
+    `.gitignore` against a path relative to the workspace. Windows matches
+    names without regard to case, so these do too."""
+
+    def __init__(self, patterns: list[str] | None = None) -> None:
+        lines = [p.casefold() if _CASELESS else p for p in patterns or []]
+        self.spec = pathspec.GitIgnoreSpec.from_lines(lines) if lines else None
+
+    def __bool__(self) -> bool:
+        return self.spec is not None
+
+    def _match(self, relative: str) -> bool:
+        assert self.spec is not None
+        return bool(self.spec.match_file(relative.casefold() if _CASELESS else relative))
+
+    def hides(self, names: list[str], directory: bool | None = None) -> bool:
+        """Whether `names` is hidden: it, or a folder it is in. `directory`
+        None (not known) matches it both as a file and as a folder."""
+        if self.spec is None or not names:
+            return False
+        for depth in range(1, len(names)):
+            if self._match("/".join(names[:depth]) + "/"):
+                return True
+        whole = "/".join(names)
+        if directory is not False and self._match(whole + "/"):
+            return True
+        return directory is not True and self._match(whole)
+
+    def check(self, names: list[str]) -> None:
+        """Refuse a path a tool names, whether or not it exists."""
+        if self.spec is None:
+            return
+        if _CASELESS and any(_SHORT_NAME.fullmatch(n) for n in names):
+            raise FolderError(
+                "Use each name in full: this workspace hides some paths, and a short name "
+                "(NAME~1) could stand for one."
+            )
+        if self.hides(names):
+            raise FolderError(HIDDEN)
 
 
 @dataclass(frozen=True)
@@ -149,19 +205,32 @@ def inspect(path: str, protected: list[Path]) -> str:
 
 
 def operate(
-    path: str, expected: str, tool: str, arguments: dict[str, Any], protected: list[Path]
+    path: str,
+    expected: str,
+    tool: str,
+    arguments: dict[str, Any],
+    protected: list[Path],
+    deny: list[str] | None = None,
 ) -> dict[str, Any]:
     if sys.platform.startswith("linux"):
         from .folder_linux import isolated
 
-        return isolated(lambda: _operate(path, expected, tool, arguments, protected))
-    return _operate(path, expected, tool, arguments, protected)
+        return isolated(lambda: _operate(path, expected, tool, arguments, protected, deny))
+    return _operate(path, expected, tool, arguments, protected, deny)
 
 
 def _operate(
-    path: str, expected: str, tool: str, arguments: dict[str, Any], protected: list[Path]
+    path: str,
+    expected: str,
+    tool: str,
+    arguments: dict[str, Any],
+    protected: list[Path],
+    deny: list[str] | None = None,
 ) -> dict[str, Any]:
     names = parts(arguments.get("path", "."), directory=tool in DIRECTORY_PATHS)
+    hidden = Hidden(deny)
+    # Before anything is opened: the same refusal whether or not it exists.
+    hidden.check(names)
     with root(path, expected) as folder:
         check_root_path(folder.path, protected)
         if sys.platform.startswith("linux"):
@@ -169,12 +238,22 @@ def _operate(
         if tool in {"read_text", "edit_text", "glob", "grep"}:
             from . import workspace_tools
 
-            return workspace_tools.run(folder, tool, names, arguments)
+            return workspace_tools.run(folder, tool, names, arguments, hidden)
         if tool == "list_directory":
-            entries = folder.names(names, MAX_ENTRIES + 1)
+            more = False
+            if hidden:
+                # Twice the page, so hidden names do not end it early.
+                listed = folder.entries(names, 2 * MAX_ENTRIES + 1)
+                more = len(listed) > 2 * MAX_ENTRIES
+                entries = [e.name for e in listed if not hidden.hides([*names, e.name], _is_dir(e))]
+            else:
+                entries = folder.names(names, MAX_ENTRIES + 1)
             for entry in entries:
                 _utf8(entry)
-            return {"names": sorted(entries[:MAX_ENTRIES]), "truncated": len(entries) > MAX_ENTRIES}
+            return {
+                "names": sorted(entries)[:MAX_ENTRIES],
+                "truncated": more or len(entries) > MAX_ENTRIES,
+            }
         if tool != "write_text":
             raise FolderError("This file tool is not supported.")
         data = text_bytes(arguments["text"])
@@ -191,6 +270,11 @@ def _operate(
                     )
             rewrite(fd, data)
         return {"written": len(data), "sha256": hashlib.sha256(data).hexdigest()}
+
+
+def _is_dir(entry: Entry) -> bool | None:
+    """An entry's kind as `Hidden.hides` takes it: not known for a link."""
+    return True if entry.kind == "dir" else False if entry.kind == "file" else None
 
 
 def rewrite(fd: int, data: bytes) -> None:

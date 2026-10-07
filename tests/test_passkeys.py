@@ -285,7 +285,8 @@ def test_the_mac_key_is_pbkdf2_as_the_contract_says(monkeypatch: pytest.MonkeyPa
     assert pk.mac(key, text) == b64url(digest)
 
 
-async def test_only_the_owner_gets_a_code(open_site: OpenSite, tmp_path: Path) -> None:
+async def test_every_linked_person_gets_a_code(open_site: OpenSite, tmp_path: Path) -> None:
+    """Since 2b.3b any linked person pairs their own passkey (J67)."""
     site = await open_site(signed=False)
     links = site.host.settings.links_file
     assert links is not None
@@ -295,8 +296,7 @@ async def test_only_the_owner_gets_a_code(open_site: OpenSite, tmp_path: Path) -
         link_entry(BO, OTHER_ACCOUNT, "bo"),
     )
     _touch(links)
-    with pytest.raises(NotHeld):
-        site.host.passkey_code(BO)
+    assert site.host.passkey_code(BO)["subject"] == BO
     with pytest.raises(NotHeld):
         site.host.passkey_code("person-nobody")
     assert site.host.passkey_code(ADA)["subject"] == ADA
@@ -508,7 +508,7 @@ async def test_a_held_change_turned_down_from_workbench_is_dropped(
     assert gone["status"] == "failed"
 
 
-async def test_nobody_but_the_owner_lists_or_approves(
+async def test_nobody_unlinked_lists_or_approves(
     ready: tuple[Site, Authenticator, str],
 ) -> None:
     site, passkey, _ident = ready
@@ -519,7 +519,7 @@ async def test_nobody_but_the_owner_lists_or_approves(
         ("passkey.remove", {"id": passkey.id}),
     ):
         refused = await site.manage(BO, action, **arguments)
-        assert refused["status"] == "failed" and "Only this machine's owner" in refused["message"]
+        assert refused["status"] == "failed" and "not linked" in refused["message"]
 
 
 async def test_a_refused_passkey_action_is_recorded_without_its_secrets(

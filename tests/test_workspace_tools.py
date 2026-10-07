@@ -298,7 +298,7 @@ async def test_an_edit_too_large_or_in_a_read_only_folder_is_refused(
         },
         grants=grants,
     )
-    assert answer["status"] == "failed" and "may read" in answer["message"], answer
+    assert answer["status"] == "failed" and "may not change files" in answer["message"], answer
 
 
 # --- glob ----------------------------------------------------------------------

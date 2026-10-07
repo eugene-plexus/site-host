@@ -37,15 +37,16 @@ async def test_a_new_tool_arrives_with_its_server_and_runs_under_the_sites_polic
     tools = {t["name"]: t for t in on["result"]["server"]["tools"]}
     assert tools["echo"]["readOnly"] and not tools["echo"]["destructive"]
     assert tools["touch"]["destructive"], "an unmarked tool is destructive, as MCP defaults"
-    refused = await site.manage(
+    # A destructive tool may be granted, and is asked about by default (J78);
+    # a tool the server does not list is refused now, never held (J14a).
+    unknown = await site.manage(
         ADA,
         "access.set",
         approve=False,
         server="fixture",
-        people=[{"subject": BO, "tools": [{"name": "touch"}]}],
+        people=[{"subject": BO, "tools": [{"name": "rm"}]}],
     )
-    assert refused["status"] == "failed" and "standing pre-approval" in refused["message"]
-    # Refused now, from the tools the server listed: nothing is held (J14a).
+    assert unknown["status"] == "failed" and "no tool named 'rm'" in unknown["message"]
     assert site.host.held.all() == []
     granted = await site.manage(
         ADA, "access.set", server="fixture", people=[{"subject": BO, "tools": [{"name": "echo"}]}]
@@ -59,7 +60,9 @@ async def test_a_new_tool_arrives_with_its_server_and_runs_under_the_sites_polic
         server="fixture",
         people=[{"subject": BO, "tools": [{"name": "echo"}, {"name": "touch", "standing": True}]}],
     )
-    assert more["status"] == "held" and site.host.policy.tools_for(BO, "fixture") == {"echo": False}
+    assert more["status"] == "held" and site.host.policy.tools_for(BO, "fixture") == {
+        "echo": "allow"
+    }
     site.host.reject(site.host.held.for_subject(ADA)[0].id, ADA)
     echoed = await site.mcp(
         BO, "fixture", "tools/call", {"name": "echo", "arguments": {"text": "hi"}}

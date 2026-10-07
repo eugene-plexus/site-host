@@ -16,7 +16,9 @@ Everything runs inside `folder_io`'s held folder, on its handles:
   20,000 entries. Patterns run on the `regex` package with what is left of
   those 10 s as their timeout, so a pattern that would never finish stops
   (J74): Python's own `re` cannot be stopped, and its thread would hold one
-  of the worker's call slots for good.
+  of the worker's call slots for good. What the workspace's deny patterns
+  hide (`folder_io.Hidden`, J70) is passed over without a word: it is not
+  counted among what was skipped.
 
 **Every answer fits.** The site refuses an answer over 70,000 bytes, and an
 MCP answer carries the result twice, as text and as structured content. So
@@ -39,7 +41,7 @@ from typing import Any
 import pathspec
 import regex
 
-from .folder_io import Entry, FolderError, parts, regular, rewrite
+from .folder_io import Entry, FolderError, Hidden, parts, regular, rewrite
 
 MAX_FILE = 16 * 1024 * 1024
 MAX_EDIT = 1024 * 1024
@@ -301,11 +303,19 @@ class Ignores:
 
 
 def walk(
-    folder: Any, start: list[str], state: Walk, *, ignore: bool, max_depth: int | None
+    folder: Any,
+    start: list[str],
+    state: Walk,
+    *,
+    ignore: bool,
+    max_depth: int | None,
+    hidden: Hidden | None = None,
 ) -> Iterator[tuple[list[str], Entry]]:
     """Every file below `start`, in name order, each with its entry. Links,
     other mounts and `.git` are passed over; so is what a `.gitignore` names
-    when `ignore` is set. `max_depth` counts levels below `start`."""
+    when `ignore` is set, and, silently, what `hidden` hides. `max_depth`
+    counts levels below `start`."""
+    hidden = hidden or Hidden()
     ignores = Ignores()
     if ignore:
         for depth in range(len(start) + 1):
@@ -330,6 +340,8 @@ def walk(
                 return
             state.visited += 1
             path = [*directory, entry.name]
+            if hidden and hidden.hides(path, entry.kind == "dir"):
+                continue
             if entry.kind == "link":
                 state.skip("links")
             elif entry.kind != "dir" and entry.kind != "file":
@@ -442,10 +454,15 @@ def _base(folder: Any, names: list[str], tool: str) -> None:
         raise FolderError(f"{tool} searches a folder, and this path is a file.")
 
 
-def glob(folder: Any, names: list[str], arguments: dict[str, Any]) -> dict[str, Any]:
+def glob(
+    folder: Any, names: list[str], arguments: dict[str, Any], hidden: Hidden | None = None
+) -> dict[str, Any]:
     pattern = compile_glob(arguments["pattern"])
-    _base(folder, names, "glob")
     start = [*names, *pattern.prefix]
+    if hidden:
+        # The pattern's leading folders name a path as `path` does.
+        hidden.check(start)
+    _base(folder, names, "glob")
     state = Walk(time.perf_counter() + SEARCH_SECONDS)
     found: list[tuple[int, str]] = []
     try:
@@ -455,6 +472,7 @@ def glob(folder: Any, names: list[str], arguments: dict[str, Any]) -> dict[str, 
             state,
             ignore=not arguments.get("includeIgnored", False),
             max_depth=pattern.depth,
+            hidden=hidden,
         ):
             if pattern.matches("/".join(path[len(start) :]), state.remaining()):
                 found.append((entry.mtime_ns, "/".join(path)))
@@ -500,7 +518,9 @@ def _shown(line: str) -> str:
     return line if len(line) <= GREP_LINE else line[:GREP_LINE] + " [cut]"
 
 
-def grep(folder: Any, names: list[str], arguments: dict[str, Any]) -> dict[str, Any]:
+def grep(
+    folder: Any, names: list[str], arguments: dict[str, Any], hidden: Hidden | None = None
+) -> dict[str, Any]:
     source: str = arguments["pattern"]
     flags = regex.MULTILINE | (regex.IGNORECASE if arguments.get("ignoreCase") else 0)
     try:
@@ -517,7 +537,12 @@ def grep(folder: Any, names: list[str], arguments: dict[str, Any]) -> dict[str, 
         iter([(names, None)])
         if single
         else walk(
-            folder, names, state, ignore=not arguments.get("includeIgnored", False), max_depth=None
+            folder,
+            names,
+            state,
+            ignore=not arguments.get("includeIgnored", False),
+            max_depth=None,
+            hidden=hidden,
         )
     )
     files: list[tuple[int, str]] = []
@@ -637,13 +662,21 @@ def grep(folder: Any, names: list[str], arguments: dict[str, Any]) -> dict[str, 
 # --- dispatch ------------------------------------------------------------------
 
 
-def run(folder: Any, tool: str, names: list[str], arguments: dict[str, Any]) -> dict[str, Any]:
+def run(
+    folder: Any,
+    tool: str,
+    names: list[str],
+    arguments: dict[str, Any],
+    hidden: Hidden | None = None,
+) -> dict[str, Any]:
+    """One tool. `names` was checked against `hidden` before the folder was
+    opened (`folder_io._operate`)."""
     if tool == "read_text":
         return read_text(folder, names, arguments)
     if tool == "edit_text":
         return edit_text(folder, names, arguments)
     if tool == "glob":
-        return glob(folder, names, arguments)
+        return glob(folder, names, arguments, hidden)
     if tool == "grep":
-        return grep(folder, names, arguments)
+        return grep(folder, names, arguments, hidden)
     raise FolderError("This file tool is not supported.")

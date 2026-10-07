@@ -1,7 +1,10 @@
 """The site's own audit log: who asked for what, and what the site decided (J8).
 
-Kept on the machine, in the host's own directory, and read by the site's
-owner, never by Eugene's owner. One JSON object a line. It never holds a
+Kept on the machine, in the host's own directory, never read by Eugene's
+owner. Each line belongs to one person, its `reader` (J80), who alone reads
+it through the root: a call or change in a workspace, its holder; one about
+a person's own keys, them; the rest, the site's owner, who also reads the
+lines from before lines had a reader. One JSON object a line. It never holds a
 file's contents or a tool's result: arguments are cut at 1,024 characters
 and a write's text is left out.
 
@@ -51,19 +54,26 @@ class Audit:
             with self.path.open("a", encoding="utf-8") as handle:
                 handle.write(line)
 
-    def newest(self, limit: int) -> list[dict[str, Any]]:
-        """The newest `limit` entries, newest first."""
+    def newest(
+        self, limit: int, reader: str | None = None, owner: bool = False
+    ) -> list[dict[str, Any]]:
+        """The newest `limit` entries, newest first: every one, or with
+        `reader` only theirs (and, for the site's `owner`, the lines that
+        name no reader). The reader itself is not part of an entry."""
+        kept: deque[dict[str, Any]] = deque(maxlen=limit)
         with self.lock:
-            kept: deque[str] = deque(maxlen=limit)
             for path in (self.previous, self.path):
-                if path.exists():
-                    with path.open(encoding="utf-8") as handle:
-                        for line in handle:
-                            kept.append(line)
-        entries = []
-        for line in reversed(kept):
-            try:
-                entries.append(json.loads(line))
-            except ValueError:
-                continue
-        return entries
+                if not path.exists():
+                    continue
+                with path.open(encoding="utf-8") as handle:
+                    for line in handle:
+                        try:
+                            entry = json.loads(line)
+                        except ValueError:
+                            continue
+                        if not isinstance(entry, dict):
+                            continue
+                        whose = entry.pop("reader", None)
+                        if reader is None or whose == reader or (owner and whose is None):
+                            kept.append(entry)
+        return list(reversed(kept))

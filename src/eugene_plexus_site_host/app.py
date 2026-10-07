@@ -10,9 +10,9 @@ The site host holds this site's enrollment and reaches its root itself
   It answers only to the token this host writes to `local_token` in its own
   data directory, which its starter can read and nobody else; and even then
   the signature, not the caller, decides.
-- `/v1/passkeys`, the same starter's (J14a.3): a code for pairing the owner's
-  passkey from Workbench, to show at the machine, and the passkeys pinned
-  here, to list and remove.
+- `/v1/passkeys`, the same starter's (J14a.3): a code for pairing a linked
+  person's passkey from Workbench (any linked person since 2b.3b, J67), to
+  show at the machine, and the passkeys pinned here, to list and remove.
 """
 
 from __future__ import annotations

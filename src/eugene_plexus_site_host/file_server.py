@@ -7,11 +7,13 @@ server's (J6). 2b.3a added a read of any part of a file, `edit_text`, `glob`
 and `grep` (`workspace_tools.py`). `inspect` is not a tool: registering a
 folder is a management action (`folder.add`).
 
-Each tool takes a `folder` argument, the folder's name on this machine. The
-server is built for one person and one request: the `folder` argument lists
-only the folders that person may use, and the tools that change files
-(`write_text`, `edit_text`) appear, listing only the folders they may
-change, only when there is one.
+Each tool takes a `folder` argument, a workspace's name in the person's view
+(their own workspaces, then those the owner shared with them, 2b.3b). The
+server is built for one person and one request: the tools that read list only
+the workspaces whose rules let that person read, and the tools that change
+files (`write_text`, `edit_text`) only those whose rules let them change
+files; a tool with no workspace is not offered. A workspace's hidden paths
+(`folder_io.Hidden`) travel with it.
 
 Every argument is checked here as well as by the schema the model was given,
 because the person's worker must not depend on what checked it before. The
@@ -222,12 +224,18 @@ def check_arguments(tool: str, arguments: dict[str, Any]) -> None:
 
 
 def run(
-    path: str, identity: str, tool: str, arguments: dict[str, Any], protected: list[Path]
+    path: str,
+    identity: str,
+    tool: str,
+    arguments: dict[str, Any],
+    protected: list[Path],
+    deny: list[str] | None = None,
 ) -> dict[str, Any]:
     """One operation on one folder, with the worker's argument rules
-    (`folder_io`). `arguments` no longer carries `folder`."""
+    (`folder_io`) and the workspace's hidden paths. `arguments` no longer
+    carries `folder`."""
     check_arguments(tool, arguments)
-    return folder_io.operate(path, identity, tool, arguments, protected)
+    return folder_io.operate(path, identity, tool, arguments, protected, deny)
 
 
 def server(
@@ -235,10 +243,17 @@ def server(
     writable: frozenset[str],
     protected: list[Path],
     outcome: Outcome,
+    readable: frozenset[str] | None = None,
 ) -> Server:
     """The file server for one person and one request. `folders` maps each
-    name they may use to its record; `writable` names those they may change."""
-    offered = {t.name: t for t in tools(list(folders), [n for n in folders if n in writable])}
+    name they may use to its record (`path`, `identity`, and `deny`, its
+    hidden paths); `readable` names those they may read and search (all of
+    them when None), `writable` those they may change."""
+    reads = frozenset(folders) if readable is None else readable
+    offered = {
+        t.name: t
+        for t in tools([n for n in folders if n in reads], [n for n in folders if n in writable])
+    }
 
     async def list_tools(_ctx: Any, _params: Any) -> types.ListToolsResult:
         return types.ListToolsResult(tools=list(offered.values()))
@@ -249,11 +264,19 @@ def server(
         arguments = dict(params.arguments or {})
         name = arguments.pop("folder", None)
         folder = folders.get(name) if isinstance(name, str) else None
-        if folder is None or (params.name in DESTRUCTIVE and name not in writable):
+        may = writable if params.name in DESTRUCTIVE else reads
+        if folder is None or name not in may:
             return _failure(f"You may not use a folder named {name!r} for {params.name}.")
+        deny = folder.get("deny")
         try:
             result = await asyncio.to_thread(
-                run, folder["path"], folder["identity"], params.name, arguments, protected
+                run,
+                folder["path"],
+                folder["identity"],
+                params.name,
+                arguments,
+                protected,
+                [str(p) for p in deny] if isinstance(deny, list) else None,
             )
         except folder_io.WriteUncertain as exc:
             outcome.uncertain = str(exc)

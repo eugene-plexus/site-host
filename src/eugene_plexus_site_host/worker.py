@@ -136,10 +136,19 @@ class Worker:
         if work.get("kind") == "files":
             folders = work.get("folders")
             writable = work.get("writable")
-            if not isinstance(folders, dict) or not isinstance(writable, list):
+            readable = work.get("readable")
+            if (
+                not isinstance(folders, dict)
+                or not isinstance(writable, list)
+                or not isinstance(readable, list | None)
+            ):
                 raise WorkerError("This request is not valid.")
             server = file_server.server(
-                folders, frozenset(str(w) for w in writable), list(self.protected), outcome
+                folders,
+                frozenset(str(w) for w in writable),
+                list(self.protected),
+                outcome,
+                None if readable is None else frozenset(str(r) for r in readable),
             )
         elif work.get("kind") == "local":
             server = self.local.server(self._entry(work.get("server")), outcome)

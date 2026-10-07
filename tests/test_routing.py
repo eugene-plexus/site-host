@@ -168,7 +168,9 @@ async def test_the_owner_not_linked_means_nothing_runs_and_it_says_so(
     sent = record_calls(site)
     # The owner's key is pinned with their link (J14a): no link, no key, and
     # an unsigned site runs nothing, a linked person's calls included (J48).
-    for subject in (ADA, CY, BO):
+    refused = await site.mcp(ADA, FILES, "tools/call", read())
+    assert refused["status"] == "failed" and "linked your own account" in refused["message"]
+    for subject in (CY, BO):
         refused = await site.mcp(subject, FILES, "tools/call", read())
         assert refused["status"] == "failed" and "own key" in refused["message"], refused
     assert sent == []
@@ -255,7 +257,8 @@ async def test_no_sharing_refuses_a_non_owner_even_if_the_policy_file_names_them
     refused = await site.mcp(BO, FILES, "tools/call", read())
     assert refused["status"] == "failed" and "serves only its owner" in refused["message"]
     assert sent == []
-    assert (await site.mcp(ADA, FILES, "tools/list"))["status"] == "failed"  # not granted
+    # The owner's own workspace is theirs (J69).
+    assert (await site.mcp(ADA, FILES, "tools/list"))["status"] == "done"
     assert (await site.manage(ADA, "audit.read"))["status"] == "done"
 
 
@@ -421,12 +424,15 @@ async def test_the_summary_carries_links_link_page_and_sharing(
         "available": True,
         "reason": None,
         "keys": 0,
+        "signing": "unsigned",
+        "held": 0,
     }
     assert summary["signing"] == {
         "state": "unsigned",
         "held": 0,
         "approvePage": "http://127.0.0.1:8079/link/approve",
         "passkeys": True,
+        "people": True,
     }
     assert by_subject[BO]["available"] is False and by_subject[BO]["accountName"] == "HOST/bo"
     assert ABSENT_WORDS in by_subject[BO]["reason"]

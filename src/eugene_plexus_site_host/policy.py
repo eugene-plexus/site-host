@@ -1,23 +1,31 @@
-"""A job site's own policy: its folders, who may use what, and its settings.
+"""A job site's own policy: each person's workspaces and rules, who may use
+what, and its settings.
 
 This file is the list rule 2 of §3.3 speaks of: the site keeps it and
 refuses anyone not on it, so editing the root's state is not enough to get
-in (J6b). It changes only through a management action from the owner the
-site pinned at its join, and it is written whole, atomically, beside the
-host's audit log in the host's own directory.
+in (J6b). It is written whole, atomically, beside the host's audit log in
+the host's own directory.
 
-Default deny (J8). A folder is open only to the people on its own list: to
-read, or also to change files, which is a standing pre-approval for
-`write_text` and `edit_text` (J6g). A local server is off until its owner
-turns it on, and a person has none of its tools until the owner names them;
-a destructive tool is named with `standing: true`, a standing pre-approval,
-or not at all.
+**Workspaces** (2b.3b, J67-J70, `job-sites-own-enrollment.md` §3.3). A
+workspace is a folder one linked person, its holder, works in; their own
+worker, as their own account, opens it. Today's folders became the site
+owner's workspaces (J69), and only the owner's may be shared. Each person's
+rules there say `allow`, `ask` or `deny`, stored per tool (J70) so commands
+add tools of their own later; the contract speaks of two groups, read and
+change. Path patterns on a workspace can only deny, for everyone who uses
+it. A workspace registered read-only (`writable: false`) denies every
+change, whatever the rules say.
 
-**Approved** (J14a, J52): `authorized` is the digest of the rules as their
-owner last approved them with their own key, at the machine. Rules whose
-digest is not it were changed on the root's word alone, and no tool runs
-until the owner approves them as a whole. Rules that grant nothing need no
-approval.
+A local server is off until the site's owner turns it on, and a person has
+none of its tools until the owner names them, each `allow` or `ask` (J78).
+
+**Approved, per person** (J14a, J52, J67, J79): `authorized` holds, for each
+person, the digest of their own rules as they last approved them with their
+own key. The owner's covers their workspaces, whom they shared them with,
+the local servers and dev mode; anyone else's covers their own workspaces.
+Rules whose digest is not the one approved were changed without that
+person's key, and nothing runs under them until the person approves them as
+a whole. Rules that grant nothing need no approval.
 """
 
 from __future__ import annotations
@@ -29,41 +37,158 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from .file_server import SERVER, unique_names
+from .file_server import DESTRUCTIVE, READ_ONLY, SERVER, unique_names
 
-VERSION = 1
-MAX_FOLDERS = 64
+VERSION = 2
+MAX_WORKSPACES = 512
+MAX_PER_PERSON = 64
+MAX_DENY = 64
+#: The tool groups the contract speaks of (`SiteRules`).
+GROUPS: dict[str, frozenset[str]] = {"read": READ_ONLY, "change": DESTRUCTIVE}
+_ORDER = {"allow": 0, "ask": 1, "deny": 2}
+
+
+def group_of(tool: str) -> str | None:
+    return next((group for group, tools in GROUPS.items() if tool in tools), None)
+
+
+def stricter(a: str, b: str) -> str:
+    return a if _ORDER[a] >= _ORDER[b] else b
+
+
+def looser(a: str, b: str) -> bool:
+    """Whether decision `a` lets more through than `b`."""
+    return _ORDER[a] < _ORDER[b]
+
+
+def default_groups(writable: bool) -> dict[str, str]:
+    """§2.6: a person in their own workspace reads without asking and is
+    asked before changing files."""
+    return {"read": "allow", "change": "ask" if writable else "deny"}
+
+
+def per_tool(groups: dict[str, str]) -> dict[str, str]:
+    """`SiteRules` as stored: one decision per tool."""
+    return {tool: groups[group] for group, tools in GROUPS.items() for tool in sorted(tools)}
+
+
+def per_group(tools: dict[str, str], writable: bool) -> dict[str, str]:
+    """Stored rules as `SiteRules`: each group's strictest decision. A tool
+    with no decision (one added after the rules were written) is denied."""
+    groups: dict[str, str] = {}
+    for group, members in GROUPS.items():
+        decision = "allow"
+        for tool in members:
+            decision = stricter(decision, tools.get(tool, "deny"))
+        groups[group] = decision
+    if not writable:
+        groups["change"] = "deny"
+    return groups
+
+
+def decision_for(tools: dict[str, str], tool: str, writable: bool) -> str:
+    if not writable and tool in DESTRUCTIVE:
+        return "deny"
+    return tools.get(tool, "deny")
+
+
+def _from_v1(value: dict[str, Any], owner: str | None) -> dict[str, Any]:
+    """Version 1's folders as the owner's workspaces (J69), with §2.6's
+    defaults for the owner and, for each person on a folder's list, what
+    they had: changing files was a standing pre-approval, so it reads
+    `allow`. The owner's approval is not carried: its digest's shape
+    changed, and they approve their rules once more."""
+    workspaces = []
+    for folder in value.get("folders") or []:
+        writable = bool(folder.get("writable"))
+        people = [
+            {
+                "subject": str(p["subject"]),
+                "rules": per_tool(
+                    {
+                        "read": "allow",
+                        "change": "allow" if writable and p.get("writable") else "deny",
+                    }
+                ),
+            }
+            for p in folder.get("people") or []
+            if p.get("subject") != owner
+        ]
+        workspaces.append(
+            {
+                "id": folder["id"],
+                "name": folder["name"],
+                "path": folder["path"],
+                "identity": folder["identity"],
+                "holder": owner,
+                "writable": writable,
+                "rules": per_tool(default_groups(writable)),
+                "deny": [],
+                "people": people,
+            }
+        )
+    access = [
+        {
+            "subject": e["subject"],
+            "server": e["server"],
+            # A tool granted without `standing` was one the site did not treat
+            # as destructive: its decision follows the tool (J78).
+            "tools": [
+                {"name": t["name"], "decision": "allow" if t.get("standing") else None}
+                for t in e.get("tools") or []
+            ],
+        }
+        for e in value.get("access") or []
+        # Grants on the first build's per-folder servers (`files.<id>`) grant
+        # nothing now.
+        if not str(e.get("server")).startswith(SERVER)
+    ]
+    return {
+        "workspaces": workspaces,
+        "access": access,
+        "enabled": value.get("enabled") or {},
+        "ownerInDevMode": bool(value.get("ownerInDevMode")),
+        "authorized": {},
+    }
 
 
 @dataclass
 class Policy:
     path: Path
-    folders: list[dict[str, Any]] = field(default_factory=list)
+    owner: str | None = None
+    workspaces: list[dict[str, Any]] = field(default_factory=list)
     access: list[dict[str, Any]] = field(default_factory=list)
     enabled: dict[str, bool] = field(default_factory=dict)
     owner_in_dev_mode: bool = False
-    authorized: str | None = None
+    authorized: dict[str, str] = field(default_factory=dict)
 
     @classmethod
-    def load(cls, path: Path) -> Policy:
-        policy = cls(path)
+    def load(cls, path: Path, owner: str | None = None) -> Policy:
+        policy = cls(path, owner)
         if not path.exists():
             return policy
         value = json.loads(path.read_text(encoding="utf-8"))
-        if not isinstance(value, dict) or value.get("version") != VERSION:
+        if not isinstance(value, dict) or value.get("version") not in (1, VERSION):
             raise ValueError("the site's policy file is not one this host reads")
-        policy.folders = [
-            {**f, "people": list(f.get("people") or [])} for f in value.get("folders") or []
+        if value["version"] == 1:
+            value = _from_v1(value, owner)
+        policy.workspaces = [
+            {
+                **w,
+                "deny": list(w.get("deny") or []),
+                "people": list(w.get("people") or []),
+            }
+            for w in value.get("workspaces") or []
         ]
-        # Folder grants live on each folder. Grants on the first build's
-        # per-folder servers (`files.<id>`) grant nothing now.
-        policy.access = [
-            e for e in value.get("access") or [] if not str(e.get("server")).startswith(SERVER)
-        ]
+        policy.access = list(value.get("access") or [])
         policy.enabled = {str(k): bool(v) for k, v in (value.get("enabled") or {}).items()}
         policy.owner_in_dev_mode = bool(value.get("ownerInDevMode"))
         authorized = value.get("authorized")
-        policy.authorized = authorized if isinstance(authorized, str) else None
+        policy.authorized = (
+            {str(k): str(v) for k, v in authorized.items() if isinstance(v, str)}
+            if isinstance(authorized, dict)
+            else {}
+        )
         return policy
 
     def save(self) -> None:
@@ -71,7 +196,7 @@ class Policy:
         data = json.dumps(
             {
                 "version": VERSION,
-                "folders": self.folders,
+                "workspaces": self.workspaces,
                 "access": self.access,
                 "enabled": self.enabled,
                 "ownerInDevMode": self.owner_in_dev_mode,
@@ -88,62 +213,93 @@ class Policy:
             os.fsync(handle.fileno())
         os.replace(temporary, self.path)
 
-    # --- approved by the owner's key (J52) -------------------------------------
+    # --- approved by each person's own key (J52, J67, J79) ----------------------
 
-    def digest(self) -> str:
-        """SHA-256 over every rule, in a form that does not depend on order of
-        writing: what an owner's key approves as a whole."""
-        rules = {
-            "folders": self.folders,
-            "access": self.access,
-            "enabled": {k: v for k, v in sorted(self.enabled.items()) if v},
-            "ownerInDevMode": self.owner_in_dev_mode,
-        }
-        text = json.dumps(rules, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    def _rules_of(self, subject: str) -> dict[str, Any]:
+        rules: dict[str, Any] = {"workspaces": self.own(subject)}
+        if subject == self.owner:
+            rules["access"] = self.access
+            rules["enabled"] = {k: v for k, v in sorted(self.enabled.items()) if v}
+            rules["ownerInDevMode"] = self.owner_in_dev_mode
+        return rules
+
+    def digest(self, subject: str) -> str:
+        """SHA-256 over `subject`'s own rules, in a form that does not depend
+        on order of writing: what their key approves as a whole."""
+        text = json.dumps(
+            self._rules_of(subject), sort_keys=True, separators=(",", ":"), ensure_ascii=False
+        )
         return hashlib.sha256(text.encode()).hexdigest()
 
-    def grants_nothing(self) -> bool:
-        return (
-            not self.folders
-            and not self.access
-            and not any(self.enabled.values())
-            and not self.owner_in_dev_mode
-        )
+    def grants_nothing(self, subject: str) -> bool:
+        if self.own(subject):
+            return False
+        if subject != self.owner:
+            return True
+        return not self.access and not any(self.enabled.values()) and not self.owner_in_dev_mode
 
-    def approved(self) -> bool:
-        return self.grants_nothing() or self.authorized == self.digest()
+    def approved(self, subject: str) -> bool:
+        return self.grants_nothing(subject) or self.authorized.get(subject) == self.digest(subject)
 
-    def authorize(self) -> None:
-        """The rules as they are now are their owner's."""
-        self.authorized = self.digest()
+    def authorize(self, subject: str) -> None:
+        """`subject`'s rules as they are now are theirs."""
+        self.authorized[subject] = self.digest(subject)
         self.save()
 
     # --- reads ---------------------------------------------------------------
 
-    def folder(self, folder_id: str) -> dict[str, Any] | None:
-        return next((f for f in self.folders if f["id"] == folder_id), None)
+    def workspace(self, workspace_id: str) -> dict[str, Any] | None:
+        return next((w for w in self.workspaces if w["id"] == workspace_id), None)
 
-    def names(self) -> dict[str, str]:
-        """Each folder's id and its name as the `folder` argument takes it."""
-        unique = unique_names([f["name"] for f in self.folders])
-        return {f["id"]: name for f, name in zip(self.folders, unique, strict=True)}
+    def own(self, subject: str) -> list[dict[str, Any]]:
+        return [w for w in self.workspaces if w["holder"] == subject]
 
-    def folders_for(self, subject: str) -> list[tuple[dict[str, Any], bool]]:
-        """The folders `subject` may use, in order, each with whether they may
-        change files in it (never more than the folder allows)."""
-        found: list[tuple[dict[str, Any], bool]] = []
-        for folder in self.folders:
-            person = next((p for p in folder["people"] if p["subject"] == subject), None)
+    def shared_with(self, subject: str) -> list[tuple[dict[str, Any], dict[str, Any]]]:
+        """The owner's workspaces shared with `subject`, each with their entry."""
+        found = []
+        for workspace in self.own(self.owner) if self.owner else []:
+            person = next((p for p in workspace["people"] if p["subject"] == subject), None)
             if person is not None:
-                found.append((folder, bool(person["writable"] and folder["writable"])))
+                found.append((workspace, person))
         return found
 
-    def tools_for(self, subject: str, server: str) -> dict[str, bool]:
-        """The tools `subject` may use on local `server`, each with whether it
-        is pre-approved. Empty when they are not on the list."""
+    def view(self, subject: str) -> list[tuple[str, dict[str, Any], dict[str, str], bool]]:
+        """Every workspace `subject` may be offered, in order: their own, then
+        those the owner shared with them. Each with its name as their `folder`
+        argument takes it, their rules there per group, and whether it is
+        their own. The root names a person's view the same way."""
+        rows: list[tuple[dict[str, Any], dict[str, str], bool]] = [
+            (w, per_group(w["rules"], w["writable"]), True) for w in self.own(subject)
+        ]
+        rows += [
+            (w, per_group(p["rules"], w["writable"]), False) for w, p in self.shared_with(subject)
+        ]
+        names = unique_names([w["name"] for w, _, _ in rows])
+        return [
+            (name, w, groups, mine) for name, (w, groups, mine) in zip(names, rows, strict=True)
+        ]
+
+    # --- as version 1 read them: folders are workspaces ------------------------
+
+    @property
+    def folders(self) -> list[dict[str, Any]]:
+        return self.workspaces
+
+    def folder(self, folder_id: str) -> dict[str, Any] | None:
+        return self.workspace(folder_id)
+
+    def folders_for(self, subject: str) -> list[tuple[dict[str, Any], bool]]:
+        """The workspaces in `subject`'s view, each with whether their rules
+        there let them change files at all."""
+        return [(w, groups["change"] != "deny") for _, w, groups, _ in self.view(subject)]
+
+    def tools_for(self, subject: str, server: str) -> dict[str, str | None]:
+        """The tools `subject` may use on local `server`, each with its
+        decision (None: follows whether the tool is destructive, J78). Empty
+        when they are not on the list."""
         for entry in self.access:
             if entry["subject"] == subject and entry["server"] == server:
-                return {t["name"]: bool(t.get("standing")) for t in entry["tools"]}
+                return {t["name"]: t.get("decision") for t in entry["tools"]}
         return {}
 
     def people(self, server: str) -> list[dict[str, Any]]:
@@ -153,24 +309,35 @@ class Policy:
             if e["server"] == server
         ]
 
-    # --- changes (the owner's, through the host) -----------------------------
+    # --- changes (through the host) ------------------------------------------
 
-    def add_folder(self, folder: dict[str, Any]) -> None:
-        if len(self.folders) >= MAX_FOLDERS:
-            raise ValueError(f"This machine already has {MAX_FOLDERS} folders. Remove one first.")
-        self.folders.append({**folder, "people": []})
+    def add_workspace(self, workspace: dict[str, Any]) -> None:
+        if len(self.workspaces) >= MAX_WORKSPACES:
+            raise ValueError(
+                f"This machine already has {MAX_WORKSPACES} workspaces. Remove one first."
+            )
+        if len(self.own(workspace["holder"])) >= MAX_PER_PERSON:
+            raise ValueError(
+                f"You already have {MAX_PER_PERSON} workspaces here. Remove one first."
+            )
+        self.workspaces.append({**workspace, "people": list(workspace.get("people") or [])})
         self.save()
 
-    def remove_folder(self, folder_id: str) -> None:
-        self.folders = [f for f in self.folders if f["id"] != folder_id]
+    def remove_workspace(self, workspace_id: str) -> None:
+        self.workspaces = [w for w in self.workspaces if w["id"] != workspace_id]
         self.save()
 
-    def set_folder_people(self, folder_id: str, people: list[dict[str, Any]]) -> None:
-        folder = self.folder(folder_id)
-        assert folder is not None
-        folder["people"] = [
-            {"subject": p["subject"], "writable": bool(p["writable"])} for p in people
-        ]
+    def set_people(self, workspace_id: str, people: list[dict[str, Any]]) -> None:
+        workspace = self.workspace(workspace_id)
+        assert workspace is not None
+        workspace["people"] = people
+        self.save()
+
+    def set_rules(self, workspace_id: str, rules: dict[str, str], deny: list[str]) -> None:
+        workspace = self.workspace(workspace_id)
+        assert workspace is not None
+        workspace["rules"] = rules
+        workspace["deny"] = deny
         self.save()
 
     def set_access(self, server: str, people: list[dict[str, Any]]) -> None:

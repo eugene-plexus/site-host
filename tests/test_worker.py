@@ -15,6 +15,7 @@ import yaml
 
 from eugene_plexus_site_host import accounts, folder_io, local_channel, worker
 from eugene_plexus_site_host.local_channel import MAX_FRAME
+from eugene_plexus_site_host.policy import default_groups, per_tool
 from eugene_plexus_site_host.worker import Worker, WorkerError
 
 from .conftest import ADA, BO, OpenSite, link_entry, local_server, rpc, write_links
@@ -152,10 +153,13 @@ async def test_a_folder_inside_the_workers_protected_roots_is_refused_though_the
         "name": "Secret",
         "path": str(secret),
         "identity": work["folders"]["Notes"]["identity"],
+        "holder": ADA,
         "writable": False,
+        "rules": per_tool(default_groups(False)),
+        "deny": [],
+        "people": [{"subject": BO, "rules": per_tool({"read": "allow", "change": "deny"})}],
     }
-    site.host.policy.add_folder(record)
-    site.host.policy.set_folder_people("f1", [{"subject": BO, "writable": False}])
+    site.host.policy.add_workspace(record)
     # Written behind the site's back, so approved at the machine first (J52).
     assert (await site.confirm_rules())["status"] == "done"
     read = {"name": "read_text", "arguments": {"folder": "Secret", "path": "node.yaml"}}
