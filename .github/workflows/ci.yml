@@ -28,6 +28,8 @@ jobs:
     # and handle-relative walks on Windows, and each is its own code path.
     name: Lint, type-check, test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
+    # A hung test fails in minutes, not after six hours (2026-10-06).
+    timeout-minutes: 15
     strategy:
       fail-fast: false
       matrix:
