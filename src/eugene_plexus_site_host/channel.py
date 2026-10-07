@@ -36,6 +36,20 @@ log = logging.getLogger(__name__)
 RECHECK_SECONDS = 60.0
 
 
+def _reason(response: httpx.Response) -> str | None:
+    """The sentence a root's Problem gives (`{"detail": {"detail": ...}}`),
+    when it is one line of at most 300 characters; otherwise None."""
+    try:
+        body: Any = response.json()
+    except ValueError:
+        return None
+    problem = body.get("detail") if isinstance(body, dict) else None
+    words = problem.get("detail") if isinstance(problem, dict) else None
+    if not isinstance(words, str) or not words.strip() or not words.isprintable():
+        return None
+    return words.strip()[:300]
+
+
 class Removed(Exception):
     """The root refused this site's token."""
 
@@ -121,6 +135,9 @@ class Channel:
                             "request": op.get("request"),
                             "grants": op.get("grants") or [],
                             "installMode": op.get("installMode") or "production",
+                            # Workbench's word that the person approved this
+                            # call (J72); without it an "ask" tool is refused.
+                            "asked": bool(op.get("asked")),
                         }
                     )
                 )
@@ -193,7 +210,11 @@ class Channel:
         if response.status_code == 401:
             raise PermissionError("That name or password is not right.")
         if response.status_code == 403:
-            raise PermissionError("That person is turned off, or is not a person on a site.")
+            # The root's own reason says what to do next: a person turned
+            # off, or not let use job sites (J77). Without one, ours.
+            raise PermissionError(
+                _reason(response) or "That person is turned off, or is not a person on a site."
+            )
         if response.status_code == 429:
             raise PermissionError("Too many tries. Wait a minute and try again.")
         if response.status_code != 200:

@@ -16,6 +16,7 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
 from eugene_plexus_site_host import channel as channel_module
 from eugene_plexus_site_host import join as join_module
+from eugene_plexus_site_host._generated.models import SiteCall
 from eugene_plexus_site_host.channel import Channel, Removed
 from eugene_plexus_site_host.host import Host
 from eugene_plexus_site_host.identity import Identity, load_public, public_b64
@@ -237,6 +238,40 @@ async def test_the_channel_reports_and_runs_an_operation_for_this_enrollment(
     assert link.problem is None and link.last_contact is not None
 
 
+@pytest.mark.parametrize("asked", [True, False, None])
+async def test_a_call_carries_workbenchs_word_that_the_person_was_asked(
+    tmp_path: Path, root: FakeRoot, asked: bool | None
+) -> None:
+    """J72: the root's `asked` reaches the policy; dropped on the way, every
+    "ask" tool would be refused after the person approved it in Workbench."""
+    _, link = await joined_site(tmp_path, root)
+    seen: list[SiteCall] = []
+
+    async def mcp(call: SiteCall) -> dict[str, Any]:
+        seen.append(call)
+        return {"status": "done", "response": {}}
+
+    link.host.mcp = mcp  # type: ignore[method-assign]
+    root.queue.append(
+        {
+            "id": "op-1",
+            "expiresAt": time.time() + 20,
+            "site": SITE,
+            "enrolledAt": root.enrolled_at,
+            "subject": ADA,
+            "kind": "mcp",
+            "server": "files",
+            "request": {"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}},
+            "installMode": "production",
+            "grants": [],
+            **({} if asked is None else {"asked": asked}),
+        }
+    )
+    await link.step()
+    assert root.results["op-1"]["status"] == "done", root.results
+    assert [c.asked for c in seen] == [bool(asked)]
+
+
 async def test_an_operation_for_another_enrollment_never_runs(
     tmp_path: Path, root: FakeRoot
 ) -> None:
@@ -318,10 +353,34 @@ async def test_check_person_says_what_the_root_said_no_to(
     tmp_path: Path, root: FakeRoot, status: int, words: str
 ) -> None:
     _, link = await joined_site(tmp_path, root)
-    root.person_answer = (status, {"detail": {"detail": "x"}})
+    root.person_answer = (status, {"detail": "x"})
     with pytest.raises(PermissionError, match=words):
         await link.check_person("jo", "pw")
     assert root.person_checks, "the root was asked"
+
+
+@pytest.mark.parametrize(
+    ("detail", "words"),
+    [
+        (
+            "Eugene's owner has not let you use job sites as yourself.",
+            "^Eugene's owner has not let you use job sites as yourself.$",
+        ),
+        ("two\nlines", "turned off, or is not a person on a site"),
+        ("   ", "turned off, or is not a person on a site"),
+        (7, "turned off, or is not a person on a site"),
+    ],
+)
+async def test_check_person_refused_says_the_roots_own_reason(
+    tmp_path: Path, root: FakeRoot, detail: Any, words: str
+) -> None:
+    """J77: a person not let use job sites is told so, in the root's words,
+    which say where it is changed; a reason that is not one line is not
+    relayed."""
+    _, link = await joined_site(tmp_path, root)
+    root.person_answer = (403, {"detail": {"title": "Not allowed", "detail": detail}})
+    with pytest.raises(PermissionError, match=words):
+        await link.check_person("jo", "pw")
 
 
 async def test_check_person_on_a_machine_that_has_not_joined_asks_nobody(

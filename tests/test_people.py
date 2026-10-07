@@ -437,6 +437,27 @@ async def test_the_owners_unconfirmed_rules_do_not_stop_another_persons_own(
     assert enum(await tools(site, BO), "read_text") == ["Mine"]
 
 
+async def test_with_both_unconfirmed_each_refusal_names_whose_rules_to_approve(
+    two: tuple[Site, PersonKey, Path],
+) -> None:
+    """Nothing offered, and each workspace blocked for a different person's
+    rules: the call is told about the one it names (J79), not the first."""
+    site, _bo, _mine = two
+    path = site.host.settings.data_dir / "policy.json"
+    edited = Policy.load(path, ADA)
+    edited.own(ADA)[0]["rules"]["write_text"] = "allow"
+    edited.own(BO)[0]["rules"]["write_text"] = "allow"
+    edited.save()
+    site.host.policy = Policy.load(path, ADA)
+    assert site.host.signing_state(ADA) == site.host.signing_state(BO) == "unconfirmed"
+    for folder, words in (
+        ("Notes", "owner has not approved its rules"),
+        ("Mine", "approved your rules"),
+    ):
+        refused = await call(site, BO, "read_text", folder=folder, path="x.txt")
+        assert refused["status"] == "failed" and words in refused["message"], (folder, refused)
+
+
 async def test_a_name_in_a_persons_view_is_unique_there(
     two: tuple[Site, PersonKey, Path], tmp_path: Path
 ) -> None:

@@ -445,7 +445,11 @@ class Host:
             entry["reader"] = self._reader(target, arguments) or entry["reader"]
             if not target.allowed:
                 if target.blocked:
-                    raise Refused(next(iter(target.blocked.values()))[0])
+                    # The reason for the workspace the call names, which may
+                    # be another person's to fix (J79); else the first.
+                    named = arguments.get("folder") if isinstance(arguments, dict) else None
+                    blocked = target.blocked.get(named) if isinstance(named, str) else None
+                    raise Refused((blocked or next(iter(target.blocked.values())))[0])
                 # With nothing offered, a person with no key yet (or rules not
                 # yet approved) is told that first: it is what to do next, and
                 # no tool runs here until it is done (J48, per person).
