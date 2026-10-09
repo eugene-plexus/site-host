@@ -23,6 +23,7 @@ from eugene_plexus_site_host import local_channel, signing
 from eugene_plexus_site_host._generated.models import (
     SiteApproval,
     SiteCall,
+    SiteCallApproval,
     SiteLocalServer,
     SiteManage,
 )
@@ -149,6 +150,9 @@ class Site:
         self.host = host
         self.key = key
         """The owner's key, pinned with their link; None for an unsigned site."""
+        self.keys: dict[str, PersonKey] = {ADA: key} if key else {}
+        """Each person's key at the machine, with which `run` signs what the
+        site holds for them (J14b), as they would on the machine's page."""
         self.worker: Worker | None = None
         self.task: asyncio.Task[None] | None = None
         self.closed = False
@@ -170,6 +174,7 @@ class Site:
             "servers": settings.local_servers,
             "protected": list(settings.protected),
             "workspace": settings.data_dir,
+            "servers_file": settings.local_servers_file,
             **own,
         }
         self.worker = Worker(**values)
@@ -207,6 +212,8 @@ class Site:
         request: dict[str, Any] | None = None,
         ident: str | None = None,
         expires: float | None = None,
+        sign: bool = True,
+        approval: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         call = SiteCall.model_validate(
             {
@@ -217,9 +224,32 @@ class Site:
                 "request": request or rpc(method, params),
                 "grants": grants or [],
                 "installMode": mode,
+                "approval": approval,
             }
         )
-        return await self.host.mcp(call)
+        return await self.run(call, sign=sign)
+
+    async def run(self, call: SiteCall, *, sign: bool = True) -> dict[str, Any]:
+        """A call from the root. What the site holds for the caller's
+        signature (J14b) is signed at once with their key at the machine, and
+        the call sent again, unless `sign` is False."""
+        answer = await self.host.mcp(call)
+        key = self.keys.get(call.subject)
+        for _ in range(2):
+            if not sign or key is None or answer.get("status") != "held":
+                return answer
+            held = answer["held"]
+            signed = await self.approve(held["id"], call.subject, key)
+            assert signed["status"] == "done", signed
+            call = call.model_copy(
+                update={
+                    "id": secrets.token_hex(8),
+                    "expiresAt": time.time() + 20,
+                    "approval": SiteCallApproval(held=held["id"]),
+                }
+            )
+            answer = await self.host.mcp(call)
+        return answer
 
     async def manage(
         self,

@@ -136,8 +136,12 @@ class Channel:
                             "grants": op.get("grants") or [],
                             "installMode": op.get("installMode") or "production",
                             # Workbench's word that the person approved this
-                            # call (J72); without it an "ask" tool is refused.
+                            # call (J72); without it an "ask" tool is refused
+                            # for a person with no key.
                             "asked": bool(op.get("asked")),
+                            # A held call sent again, maybe with its signature
+                            # (J14b); the host checks it.
+                            "approval": op.get("approval") or None,
                         }
                     )
                 )

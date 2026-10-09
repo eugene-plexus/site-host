@@ -426,6 +426,7 @@ async def test_the_summary_carries_links_link_page_and_sharing(
         "keys": 0,
         "signing": "unsigned",
         "held": 0,
+        "windowUntil": None,
     }
     assert summary["signing"] == {
         "state": "unsigned",

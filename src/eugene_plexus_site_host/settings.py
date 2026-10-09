@@ -43,6 +43,9 @@ class Settings:
     account_kind: str | None = None
     protected: tuple[Path, ...] = ()
     local_servers: tuple[SiteLocalServer, ...] = field(default_factory=tuple)
+    #: The same list's file, read again for the administrator's consent to
+    #: commands (J89), which may be given while the host runs.
+    local_servers_file: Path | None = None
     links_file: Path | None = None
     channel: str | None = None
     link_page: str | None = None
@@ -109,6 +112,7 @@ def from_environment(env: Mapping[str, str] | None = None) -> Settings:
         account_kind=values.get("EUGENE_PLEXUS_APP_ACCOUNT_KIND"),
         protected=protected,
         local_servers=servers,
+        local_servers_file=Path(servers_file) if servers_file else None,
         links_file=Path(links) if links else None,
         channel=values.get("SITE_HOST_CHANNEL") or None,
         link_page=values.get("SITE_HOST_LINK_PAGE") or None,

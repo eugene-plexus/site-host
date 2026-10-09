@@ -15,6 +15,13 @@ files (`write_text`, `edit_text`) only those whose rules let them change
 files; a tool with no workspace is not offered. A workspace's hidden paths
 (`folder_io.Hidden`) travel with it.
 
+**Commands** (2b.4, J84, J87): `run_command` runs one command, as the person,
+starting in one of their own workspaces whose rules say `command: ask`
+(`commandable`), and `command_output` and `command_stop` follow it by its
+handle (`commands.py`). They are offered only when the worker serving the call
+has a command registry, which it has only where an administrator consented at
+the machine (J9).
+
 Every argument is checked here as well as by the schema the model was given,
 because the person's worker must not depend on what checked it before. The
 folder code underneath holds handles, refuses links, walks one name at a
@@ -33,11 +40,22 @@ from typing import Any
 import mcp_types as types
 from mcp.server.lowlevel import Server
 
+from . import commands as cmd
 from . import folder_io, workspace_tools
 
 SERVER = "files"
 READ_ONLY = frozenset({"list_directory", "read_text", "glob", "grep"})
 DESTRUCTIVE = folder_io.WRITING
+#: The tool that runs a program (J88's group), and those that follow one by
+#: its handle, which take no `folder`.
+COMMANDS = frozenset({"run_command"})
+HANDLES = frozenset({"command_output", "command_stop"})
+COMMAND_TOOLS = COMMANDS | HANDLES
+_HANDLE = {
+    "type": "string",
+    "pattern": "^c[a-f0-9]{12}$",
+    "description": "The handle run_command gave.",
+}
 
 _PATH = {
     "type": "string",
@@ -141,16 +159,68 @@ _DEFINITIONS: tuple[tuple[str, str, dict[str, Any], tuple[str, ...]], ...] = (
         ("pattern",),
     ),
 )
-_SCHEMAS = {name: (props, frozenset(required)) for name, _, props, required in _DEFINITIONS}
 
 
-def tools(readable: list[str], writable: list[str]) -> list[types.Tool]:
+def _command_definitions() -> tuple[tuple[str, str, dict[str, Any], tuple[str, ...]], ...]:
+    shell = cmd.shell_name()
+    wait = int(cmd.WAIT_SECONDS)
+    limit = int(cmd.LIMIT_SECONDS // 60)
+    return (
+        (
+            "run_command",
+            f"Run one command in {shell}, as your own account on this machine, starting in the "
+            "folder (or path inside it). It can do whatever your account can, not only in the "
+            "folder. No input is given; stdout and stderr come together. Each command needs "
+            f"your signature. Waits up to {wait} seconds: if it is still running, the answer has "
+            "what it printed so far and a handle for command_output and command_stop. It is "
+            f"stopped after {limit} minutes, and anything it leaves running is stopped when it "
+            f"ends. At most {cmd.MAX_RUNNING} run at once.",
+            {
+                "command": {"type": "string", "minLength": 1, "maxLength": cmd.MAX_COMMAND},
+                "path": _FOLDER_PATH,
+            },
+            ("command",),
+        ),
+        (
+            "command_output",
+            "Read on in a command's output from byte `from` (nextByte of the last answer; "
+            f"omitted, its start and newest output), waiting up to `wait` seconds ({wait} at "
+            "most) for it to end. Says whether it is still running, and its exit code.",
+            {
+                "handle": _HANDLE,
+                "from": {"type": "integer", "minimum": 0, "maximum": 1 << 40},
+                "wait": {"type": "integer", "minimum": 0, "maximum": wait},
+            },
+            ("handle",),
+        ),
+        (
+            "command_stop",
+            "Stop a running command and everything it started, and show its last output.",
+            {"handle": _HANDLE},
+            ("handle",),
+        ),
+    )
+
+
+_SCHEMAS = {
+    name: (props, frozenset(required))
+    for name, _, props, required in (*_DEFINITIONS, *_command_definitions())
+}
+
+
+def tools(
+    readable: list[str], writable: list[str], commandable: list[str] | None = None
+) -> list[types.Tool]:
     """The tools for one person: `folder` names only `readable` (for
-    a tool that changes files, only `writable`), and a tool with no folder is
-    not offered."""
+    a tool that changes files, only `writable`; for `run_command`, only
+    `commandable`), and a tool with no folder is not offered. The tools that
+    follow a command come with `run_command`."""
     offered: list[types.Tool] = []
-    for name, description, properties, required in _DEFINITIONS:
-        names = writable if name in DESTRUCTIVE else readable
+    for name, description, properties, required in (*_DEFINITIONS, *_command_definitions()):
+        if name in COMMAND_TOOLS:
+            names = list(commandable or [])
+        else:
+            names = writable if name in DESTRUCTIVE else readable
         if not names:
             continue
         folder = {
@@ -158,21 +228,22 @@ def tools(readable: list[str], writable: list[str]) -> list[types.Tool]:
             "enum": list(names),
             "description": "Which folder on this machine, by its name.",
         }
+        takes_folder = name not in HANDLES
         offered.append(
             types.Tool(
                 name=name,
                 description=description,
                 input_schema={
                     "type": "object",
-                    "properties": {"folder": folder, **properties},
-                    "required": ["folder", *required],
+                    "properties": {"folder": folder, **properties} if takes_folder else properties,
+                    "required": ["folder", *required] if takes_folder else list(required),
                     "additionalProperties": False,
                 },
                 annotations=types.ToolAnnotations(
-                    read_only_hint=name in READ_ONLY,
-                    destructive_hint=name in DESTRUCTIVE,
+                    read_only_hint=name in READ_ONLY or name == "command_output",
+                    destructive_hint=name in DESTRUCTIVE or name in COMMANDS | {"command_stop"},
                     idempotent_hint=name in READ_ONLY,
-                    open_world_hint=False,
+                    open_world_hint=name in COMMANDS,
                 ),
             )
         )
@@ -238,30 +309,98 @@ def run(
     return folder_io.operate(path, identity, tool, arguments, protected, deny)
 
 
+def _result(result: dict[str, Any]) -> types.CallToolResult:
+    return types.CallToolResult(
+        content=[types.TextContent(type="text", text=json.dumps(result, ensure_ascii=False))],
+        structured_content=result,
+        is_error=False,
+    )
+
+
+def start_in(folder: dict[str, Any], path: str, protected: list[Path]) -> str:
+    """Where a command starts: the workspace, or a folder inside it, checked as
+    the file tools check a path (no links, no `..`, nothing hidden). The
+    command is not confined to it: it runs with the person's whole account."""
+    names = folder_io.parts(path, directory=True)
+    deny = folder.get("deny")
+    folder_io.Hidden([str(p) for p in deny] if isinstance(deny, list) else None).check(names)
+    with folder_io.root(folder["path"], folder["identity"]) as held:
+        folder_io.check_root_path(held.path, protected)
+        if names and not held.is_directory(names):
+            raise folder_io.FolderError("That is not a folder in this workspace.")
+        return str(Path(held.path, *names))
+
+
 def server(
     folders: dict[str, dict[str, Any]],
     writable: frozenset[str],
     protected: list[Path],
     outcome: Outcome,
     readable: frozenset[str] | None = None,
+    commandable: frozenset[str] = frozenset(),
+    commands: cmd.Commands | None = None,
+    budget: float = cmd.WAIT_SECONDS,
 ) -> Server:
     """The file server for one person and one request. `folders` maps each
     name they may use to its record (`path`, `identity`, and `deny`, its
     hidden paths); `readable` names those they may read and search (all of
-    them when None), `writable` those they may change."""
+    them when None), `writable` those they may change, `commandable` those
+    they may start a command in, when `commands` (this worker's registry) is
+    given. `budget` is how long this call may take, in seconds."""
     reads = frozenset(folders) if readable is None else readable
+    runs = frozenset(n for n in folders if n in commandable) if commands else frozenset()
     offered = {
         t.name: t
-        for t in tools([n for n in folders if n in reads], [n for n in folders if n in writable])
+        for t in tools(
+            [n for n in folders if n in reads],
+            [n for n in folders if n in writable],
+            [n for n in folders if n in runs],
+        )
     }
 
     async def list_tools(_ctx: Any, _params: Any) -> types.ListToolsResult:
         return types.ListToolsResult(tools=list(offered.values()))
 
+    async def command(tool: str, arguments: dict[str, Any]) -> types.CallToolResult:
+        assert commands is not None
+        try:
+            given = {k: v for k, v in arguments.items() if k != "folder"}
+            check_arguments(tool, given if tool in COMMANDS else arguments)
+            if tool == "run_command":
+                name = arguments.get("folder")
+                folder = folders.get(name) if isinstance(name, str) else None
+                if folder is None or name not in runs:
+                    return _failure(f"You may not run commands in a folder named {name!r}.")
+                cwd = await asyncio.to_thread(
+                    start_in, folder, arguments.get("path", "."), protected
+                )
+                # Once it started it may have acted, whatever happens next.
+                outcome.uncertain = "The command started; it may have acted."
+                result = await commands.run(
+                    folder=str(name), cwd=cwd, command=arguments["command"], budget=budget
+                )
+                outcome.uncertain = None
+            elif tool == "command_output":
+                wait = min(float(arguments.get("wait", 0)), max(0.0, budget))
+                result = await commands.output(arguments["handle"], arguments.get("from"), wait)
+            else:
+                result = await commands.stop(arguments["handle"])
+        except (cmd.CommandError, folder_io.FolderError) as exc:
+            return _failure(str(exc))
+        except PermissionError:
+            return _failure("Your account cannot open that folder.")
+        except FileNotFoundError:
+            return _failure("That folder was not found.")
+        except (ValueError, KeyError, TypeError, OSError):
+            return _failure("The folder could not be opened safely. Check its path.")
+        return _result(result)
+
     async def call_tool(_ctx: Any, params: types.CallToolRequestParams) -> types.CallToolResult:
         if params.name not in offered:
             return _failure(f"This machine's file server has no tool named {params.name!r}.")
         arguments = dict(params.arguments or {})
+        if params.name in COMMAND_TOOLS:
+            return await command(params.name, arguments)
         name = arguments.pop("folder", None)
         folder = folders.get(name) if isinstance(name, str) else None
         may = writable if params.name in DESTRUCTIVE else reads
@@ -294,11 +433,7 @@ def server(
             return _failure(
                 "The file could not be opened safely. Check its path, permissions and file type."
             )
-        return types.CallToolResult(
-            content=[types.TextContent(type="text", text=json.dumps(result, ensure_ascii=False))],
-            structured_content=result,
-            is_error=False,
-        )
+        return _result(result)
 
     return Server(SERVER, on_list_tools=list_tools, on_call_tool=call_tool)
 

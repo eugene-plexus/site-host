@@ -292,12 +292,13 @@ async def test_the_audit_log_records_decisions_and_never_contents(site: Site, fo
     notes = await add(site, folder, writable=True)
     await give(site, notes, (BO, True))
     await site.mcp(BO, FILES, "tools/call", write("Notes", "s.txt", "SECRET"))
-    await site.mcp(ADA, FILES, "tools/call", write("Notes", "t.txt", "SECRET"))
+    await site.mcp(ADA, FILES, "tools/call", write("Notes", "t.txt", "SECRET"), sign=False)
     page = await site.manage(ADA, "audit.read", limit=10)
     entries = page["result"]["entries"]
-    # The holder is asked before changing files (§2.6): unasked, refused.
-    assert entries[0]["subject"] == ADA and entries[0]["decision"] == "refused"
-    assert entries[0]["rule"] == "ask" and entries[0]["asked"] is False
+    # The holder is asked before changing files (§2.6): with a key, unsigned,
+    # it is held for their signature (J14b, J86), and nothing ran.
+    assert entries[0]["subject"] == ADA and entries[0]["outcome"] == "held"
+    assert entries[0]["rule"] == "ask" and "signed" not in entries[0]
     assert entries[1]["subject"] == BO and entries[1]["decision"] == "allowed"
     assert entries[1]["rule"] == "allow" and "reader" not in entries[1]
     assert entries[1]["tool"] == "write_text" and "SECRET" not in json.dumps(entries)
@@ -350,7 +351,7 @@ async def test_the_report_is_the_sites_own_list(site: Site, folder: Path) -> Non
             "name": "Notes",
             "holder": ADA,
             "writable": False,
-            "rules": {"read": "allow", "change": "deny"},
+            "rules": {"read": "allow", "change": "deny", "command": "deny"},
             "people": [{"subject": BO, "read": "allow", "change": "deny"}],
         }
     ]

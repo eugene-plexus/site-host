@@ -37,14 +37,23 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from .file_server import DESTRUCTIVE, READ_ONLY, SERVER, unique_names
+from .file_server import COMMANDS, DESTRUCTIVE, READ_ONLY, SERVER, unique_names
 
 VERSION = 2
 MAX_WORKSPACES = 512
 MAX_PER_PERSON = 64
 MAX_DENY = 64
-#: The tool groups the contract speaks of (`SiteRules`).
-GROUPS: dict[str, frozenset[str]] = {"read": READ_ONLY, "change": DESTRUCTIVE}
+#: The tool groups the contract speaks of (`SiteRules`). `command` (2b.4,
+#: J88) is `ask` or `deny`; a workspace's rules from before it have no
+#: decision for `run_command`, which reads `deny`, so no approval changes.
+GROUPS: dict[str, frozenset[str]] = {
+    "read": READ_ONLY,
+    "change": DESTRUCTIVE,
+    "command": COMMANDS,
+}
+#: The groups a shared workspace's people have rules for: commands run only
+#: in a workspace the caller holds.
+SHARED_GROUPS = ("read", "change")
 _ORDER = {"allow": 0, "ask": 1, "deny": 2}
 
 
@@ -61,15 +70,23 @@ def looser(a: str, b: str) -> bool:
     return _ORDER[a] < _ORDER[b]
 
 
-def default_groups(writable: bool) -> dict[str, str]:
+def default_groups(writable: bool, commands: bool = False) -> dict[str, str]:
     """§2.6: a person in their own workspace reads without asking and is
-    asked before changing files."""
-    return {"read": "allow", "change": "ask" if writable else "deny"}
+    asked before changing files. A new workspace of their own also asks
+    before each command (`commands`, J88); everything older denies them."""
+    return {
+        "read": "allow",
+        "change": "ask" if writable else "deny",
+        "command": "ask" if writable and commands else "deny",
+    }
 
 
 def per_tool(groups: dict[str, str]) -> dict[str, str]:
-    """`SiteRules` as stored: one decision per tool."""
-    return {tool: groups[group] for group, tools in GROUPS.items() for tool in sorted(tools)}
+    """`SiteRules` as stored: one decision per tool. A group not given is
+    denied."""
+    return {
+        tool: groups.get(group, "deny") for group, tools in GROUPS.items() for tool in sorted(tools)
+    }
 
 
 def per_group(tools: dict[str, str], writable: bool) -> dict[str, str]:
@@ -83,11 +100,12 @@ def per_group(tools: dict[str, str], writable: bool) -> dict[str, str]:
         groups[group] = decision
     if not writable:
         groups["change"] = "deny"
+        groups["command"] = "deny"
     return groups
 
 
 def decision_for(tools: dict[str, str], tool: str, writable: bool) -> str:
-    if not writable and tool in DESTRUCTIVE:
+    if not writable and (tool in DESTRUCTIVE or tool in COMMANDS):
         return "deny"
     return tools.get(tool, "deny")
 

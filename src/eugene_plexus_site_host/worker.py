@@ -24,7 +24,10 @@ says hello and answers what the site host sends:
 
 The site host has already checked the site's policy; this process adds what
 it can know without trusting the site host: who it is, which programs it
-may run, and which paths are never a folder.
+may run, and which paths are never a folder. **Commands** (2b.4) are the one
+program the site host names, and this worker starts one only while the list
+it reads itself says an administrator consented to commands here (J9, J89),
+so a site host alone cannot start a program as anyone.
 """
 
 from __future__ import annotations
@@ -43,11 +46,14 @@ from pydantic import ValidationError
 
 from . import accounts, dispatch, file_server, folder_io, local_channel
 from ._generated.models import SiteLocalServerList
+from .commands import Commands
 from .local_servers import LocalServers
 
 PROTOCOL = 1
 MAX_CALLS = 8
 RETRY_SECONDS = (1, 2, 5, 10, 15)
+#: What a call keeps back from its deadline for the answer's way home.
+MARGIN_SECONDS = 3.0
 
 
 class WorkerError(Exception):
@@ -75,6 +81,19 @@ def read_servers(path: Path | None) -> tuple[Any, ...]:
     return tuple(listed.servers)
 
 
+def commands_consented(path: Path | None) -> bool:
+    """Whether the list an administrator writes says commands may run here
+    (J89), read again each time: consent given later counts at once."""
+    if path is None:
+        return False
+    try:
+        raw = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+        listed = SiteLocalServerList.model_validate(raw)
+    except (OSError, yaml.YAMLError, ValidationError):
+        return False
+    return listed.commands is not None
+
+
 def default_workspace() -> Path:
     if sys.platform == "win32":
         base = os.environ.get("LOCALAPPDATA") or str(Path.home() / "AppData" / "Local")
@@ -93,12 +112,15 @@ class Worker:
         servers: tuple[Any, ...],
         protected: list[Path],
         workspace: Path,
+        servers_file: Path | None = None,
     ) -> None:
         self.account = account
         self.channel = channel
         self.host = host
         self.protected = protected
         self.local = LocalServers(servers, workspace)
+        self.servers_file = servers_file
+        self.commands = Commands()
         self._slots = asyncio.Semaphore(MAX_CALLS)
 
     # --- the requests --------------------------------------------------------
@@ -137,18 +159,33 @@ class Worker:
             folders = work.get("folders")
             writable = work.get("writable")
             readable = work.get("readable")
+            commandable = work.get("commandable") or []
             if (
                 not isinstance(folders, dict)
                 or not isinstance(writable, list)
                 or not isinstance(readable, list | None)
+                or not isinstance(commandable, list)
             ):
                 raise WorkerError("This request is not valid.")
+            deadline = message.get("deadline")
+            budget = (
+                float(deadline) - time.time() - MARGIN_SECONDS
+                if isinstance(deadline, int | float)
+                else 0.0
+            )
+            # Only while the administrator's consent stands, read here (J89).
+            runs = bool(commandable) and await asyncio.to_thread(
+                commands_consented, self.servers_file
+            )
             server = file_server.server(
                 folders,
                 frozenset(str(w) for w in writable),
                 list(self.protected),
                 outcome,
                 None if readable is None else frozenset(str(r) for r in readable),
+                frozenset(str(c) for c in commandable) if runs else frozenset(),
+                self.commands if runs else None,
+                max(0.0, budget),
             )
         elif work.get("kind") == "local":
             server = self.local.server(self._entry(work.get("server")), outcome)
@@ -247,20 +284,27 @@ class Worker:
             with contextlib.suppress(Exception):
                 await conn.close()
 
+    async def stop_commands(self) -> None:
+        await self.commands.close()
+
     async def run(self) -> None:
         attempt = 0
-        while True:
-            started = time.perf_counter()
-            try:
-                await self.serve_once()
-            except Stopped:
-                return
-            except local_channel.ChannelError as exc:
-                print(f"eugene-plexus-site-worker: {exc}", file=sys.stderr)
-            if time.perf_counter() - started > 60:
-                attempt = 0
-            await asyncio.sleep(RETRY_SECONDS[min(attempt, len(RETRY_SECONDS) - 1)])
-            attempt += 1
+        try:
+            while True:
+                started = time.perf_counter()
+                try:
+                    await self.serve_once()
+                except Stopped:
+                    return
+                except local_channel.ChannelError as exc:
+                    print(f"eugene-plexus-site-worker: {exc}", file=sys.stderr)
+                if time.perf_counter() - started > 60:
+                    attempt = 0
+                await asyncio.sleep(RETRY_SECONDS[min(attempt, len(RETRY_SECONDS) - 1)])
+                attempt += 1
+        finally:
+            # A command never outlives the worker that ran it.
+            await self.stop_commands()
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -280,13 +324,15 @@ def main(argv: list[str] | None = None) -> None:
     if why := accounts.refuse_to_serve(args.account, args.host, shared=args.shared_account):
         sys.exit(f"eugene-plexus-site-worker: {why}")
     protected = [Path(sys.prefix), Path(__file__).parent, *(Path(p) for p in args.protect)]
+    servers_file = Path(args.servers) if args.servers else None
     worker = Worker(
         account=args.account,
         channel=args.channel,
         host=args.host,
-        servers=read_servers(Path(args.servers) if args.servers else None),
+        servers=read_servers(servers_file),
         protected=protected,
         workspace=Path(args.workspace) if args.workspace else default_workspace(),
+        servers_file=servers_file,
     )
     with contextlib.suppress(KeyboardInterrupt):
         asyncio.run(worker.run())

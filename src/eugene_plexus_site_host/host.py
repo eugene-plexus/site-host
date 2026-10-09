@@ -19,10 +19,14 @@ anything runs:
    the owner's, as the owner, confined to the workspace as every call is
    (J27). A person's own workspaces are opened only by their own worker.
    With no worker connected, it is refused, saying why.
-8. For `tools/call`: the rule for the tool there (J70). `deny` is refused;
-   `ask` runs only when the call says the person approved it
-   (`SiteCall.asked`, J72), which this site cannot check until J14b and so
-   records as claimed.
+8. For `tools/call`: the rule for the tool there (J70). `deny` is refused.
+   **For a person with a key** (J14b, `calls.py`): `ask`, and every command,
+   runs only with their own signature over that call; `allow` only inside a
+   window they opened with their key. Without it the call is held, and
+   answered with what to sign (J86). **For a person with none** (J85): `ask`
+   runs only when the call says they approved it (`SiteCall.asked`, J72),
+   which this site cannot check and records as claimed; commands are never
+   offered to them.
 
 Then the worker serves it, `tools/list` is cut to the person's tools (the
 file server's `folder` argument to their workspaces) and each tool says in
@@ -71,6 +75,8 @@ from ._generated.models import (
     SiteApproval,
     SiteAuditRead,
     SiteCall,
+    SiteCallApproval,
+    SiteCommandsWithdraw,
     SiteDenyPattern,
     SiteFolderAdd,
     SiteFolderPeople,
@@ -87,18 +93,22 @@ from ._generated.models import (
     SiteServerEnable,
     SiteSettings,
     SiteToolGrant,
+    SiteWindowClose,
     SiteWorkspaceAdd,
     SiteWorkspaceListRequest,
     SiteWorkspacePeople,
     SiteWorkspaceRemove,
 )
 from .audit import Audit
+from .calls import Calls, Pending, TooMany, call_args, window_args
+from .consent import Consent
 from .identity import Identity
 from .links import Link, Links
 from .local_servers import LocalServerError, LocalServers
 from .policy import (
     GROUPS,
     MAX_DENY,
+    SHARED_GROUPS,
     Policy,
     default_groups,
     group_of,
@@ -116,6 +126,10 @@ OPERATOR = "operator"
 FILES = file_server.SERVER
 #: The `_meta` key on each tool `tools/list` returns: where Workbench must ask.
 ASK_META = "eugene-plexus/ask"
+#: The `_meta` key that tells Workbench this site checks the person's
+#: signature itself (J14b): it sends the call and signs what comes back held,
+#: instead of asking first.
+SIGNED_META = "eugene-plexus/signed"
 #: How long a worker has to answer one call. A local server's own limit is
 #: 20 s (`local_servers.CALL_SECONDS`), and a claimed operation lives 30 s.
 WORKER_SECONDS = 25.0
@@ -127,6 +141,17 @@ class Refused(Exception):
 
 class NotHeld(Exception):
     """No such person, key or held change here, for the starter's page."""
+
+
+class Held(Exception):
+    """A call held for its person's signature (J86): `answer` says what to sign."""
+
+    def __init__(self, answer: dict[str, Any], poll: bool = False) -> None:
+        super().__init__(answer.get("message"))
+        self.answer = answer
+        #: The same held call asked about again while its person signs: it
+        #: was recorded when first held, and is not recorded each time.
+        self.poll = poll
 
 
 _NOT_WAITING = "That is no longer waiting. Open the list again."
@@ -154,7 +179,14 @@ PASSKEY_ACTIONS = frozenset(
 )
 #: Any linked person, for their own items (J67).
 PERSON_ACTIONS = frozenset(
-    {"workspace.add", "workspace.remove", "rules.set", "workspace.list", "audit.read"}
+    {
+        "workspace.add",
+        "workspace.remove",
+        "rules.set",
+        "workspace.list",
+        "audit.read",
+        "window.close",
+    }
 )
 #: The site's owner alone.
 OWNER_ACTIONS = frozenset(
@@ -166,6 +198,7 @@ OWNER_ACTIONS = frozenset(
         "folder.add",
         "folder.remove",
         "folder.people",
+        "commands.withdraw",
     }
 )
 #: Actions that change nothing.
@@ -216,6 +249,27 @@ def _iso(moment: float) -> str:
     return datetime.fromtimestamp(moment, UTC).isoformat()
 
 
+def _shell_words() -> str:
+    from .commands import shell_name
+
+    return shell_name()
+
+
+def _command_reason(response: dict[str, Any]) -> str | None:
+    """A command's end for its audit line (J91): its exit code and time, or
+    that it still runs. Never its output."""
+    result = response.get("result")
+    found = result.get("structuredContent") if isinstance(result, dict) else None
+    if not isinstance(found, dict):
+        return None
+    seconds = found.get("seconds")
+    if found.get("running"):
+        return f"Still running after {seconds} s (handle {found.get('handle')})."
+    stopped = found.get("stopped")
+    ended = f"Stopped ({stopped})" if stopped else f"Exit code {found.get('exitCode')}"
+    return f"{ended} after {seconds} s (handle {found.get('handle')})."
+
+
 def version() -> str:
     try:
         return _build.commit() or importlib.metadata.version("eugene-plexus-site-host")
@@ -242,6 +296,9 @@ class Target:
     #: Each workspace in their view whose rules are not approved: why, and
     #: its holder.
     blocked: dict[str, tuple[str, str]] = field(default_factory=dict)
+    #: The workspaces a command may start in (J88): the caller's own, with
+    #: `command: ask`, where commands are allowed and the caller has a key.
+    commandable: list[str] = field(default_factory=list)
 
     def ask(self, tool: str) -> list[str] | bool:
         """Where `tool` must be asked about: the workspaces, on the file
@@ -253,7 +310,7 @@ class Target:
             )
             return decision == "ask"
         group = group_of(tool)
-        return [n for n, rules in self.rules.items() if group and rules[group] == "ask"]
+        return [n for n, rules in self.rules.items() if group and rules.get(group) == "ask"]
 
 
 class Host:
@@ -268,6 +325,8 @@ class Host:
         self.sequence = signing.Sequence(settings.data_dir)
         self.passkeys = pk.PasskeyStore(settings.data_dir)
         self.codes = pk.Codes()
+        self.calls = Calls()
+        self.consent = Consent(settings.local_servers_file, settings.data_dir)
         self.workers = Workers(self.links, settings.channel, None)
         self.lock = asyncio.Lock()
         self.used: dict[str, float] = {}
@@ -433,6 +492,7 @@ class Host:
             # Whose line it is (J80): the workspace's holder once it is known.
             "reader": self._owner(),
         }
+        keyed = self._keyed(call.subject)
         try:
             self._fresh(call.id, call.expiresAt)
             try:
@@ -465,24 +525,37 @@ class Host:
             if method == "tools/call":
                 rule = self._rule(target, tool, arguments)
                 entry["rule"] = rule
-                if rule == "ask":
+                if keyed:
+                    entry["signed"] = await self._signed(call, str(tool), arguments, rule, target)
+                elif rule == "ask":
                     entry["asked"] = bool(call.asked)
                     if not call.asked:
                         raise Refused(
                             f"{tool} needs your approval each time here, and this call did not "
                             "say you gave it. Workbench asks you before it runs."
                         )
+        except Held as held:
+            if not held.poll:
+                self.audit.record(**entry, decision="allowed", outcome="held", reason=str(held))
+            return held.answer
         except Refused as exc:
             self.audit.record(**entry, decision="refused", reason=str(exc))
-            return {"status": "failed", "message": str(exc)}
+            return {"status": "failed", "message": str(exc), **self._window_view(keyed, call)}
 
+        window = self._window_view(keyed, call)
         try:
             answer = await self._ask(
-                account, {"op": "mcp", "work": target.work, "request": request}
+                account,
+                {
+                    "op": "mcp",
+                    "work": target.work,
+                    "request": request,
+                    "deadline": call.expiresAt,
+                },
             )
         except Refused as exc:
             self.audit.record(**entry, decision="refused", reason=str(exc))
-            return {"status": "failed", "message": str(exc)}
+            return {"status": "failed", "message": str(exc), **window}
         except (WorkerTimeout, WorkerGone, RuntimeError) as exc:
             # Only a call that can change something may have acted: a file
             # server read or search that ran out of time did not.
@@ -492,12 +565,12 @@ class Host:
                 " It may have acted. Check before trying again." if status == "uncertain" else ""
             )
             self.audit.record(**entry, decision="allowed", outcome=status, reason=message)
-            return {"status": status, "message": message}
+            return {"status": status, "message": message, **window}
         response = answer.get("response")
         if not isinstance(response, dict):
             message = f"{target.name} answered with nothing."
             self.audit.record(**entry, decision="allowed", outcome="failed", reason=message)
-            return {"status": "failed", "message": message}
+            return {"status": "failed", "message": message, **window}
         uncertain = answer.get("uncertain") or None
         if method == "tools/list" and isinstance(response.get("result"), dict):
             listed = response["result"].get("tools") or []
@@ -507,7 +580,10 @@ class Host:
                     continue
                 found = offered.get("_meta")
                 meta: dict[str, Any] = found if isinstance(found, dict) else {}
-                kept.append({**offered, "_meta": {**meta, ASK_META: target.ask(offered["name"])}})
+                meta = {**meta, ASK_META: target.ask(offered["name"])}
+                if keyed:
+                    meta[SIGNED_META] = True
+                kept.append({**offered, "_meta": meta})
             response["result"]["tools"] = kept
         status = "uncertain" if uncertain else "done"
         if len(json.dumps(response, ensure_ascii=False).encode()) > MAX_ANSWER:
@@ -516,9 +592,229 @@ class Host:
             return {
                 "status": "uncertain" if status == "uncertain" else "failed",
                 "message": message,
+                **window,
             }
-        self.audit.record(**entry, decision="allowed", outcome=status, reason=uncertain)
-        return {"status": status, "message": uncertain, "response": response}
+        reason = uncertain or (
+            _command_reason(response) if tool in file_server.COMMAND_TOOLS else None
+        )
+        self.audit.record(**entry, decision="allowed", outcome=status, reason=reason)
+        return {"status": status, "message": uncertain, "response": response, **window}
+
+    # --- signed calls (J14b) ------------------------------------------------------
+
+    def _keyed(self, subject: str) -> bool:
+        """Whether `subject`'s calls are checked against their own signature:
+        a linked person with a key here (J85)."""
+        if subject == OPERATOR or self.links.for_subject(subject) is None:
+            return False
+        return self.has_key(subject)
+
+    def _window_view(self, keyed: bool, call: SiteCall) -> dict[str, Any]:
+        """`windowUntil` for an answer to a person with a key."""
+        if not keyed:
+            return {}
+        window = self.calls.window(call.subject)
+        return {"windowUntil": _iso(window.until) if window else None}
+
+    async def _signed(
+        self, call: SiteCall, tool: str, arguments: Any, rule: str, target: Target
+    ) -> str:
+        """How this call is signed, for its audit line, or `Held` with what to
+        sign, or `Refused` when a signature sent does not hold (J86, J91).
+        `ask`, and every command, needs the call's own signature; `allow`
+        needs an open window."""
+        subject = call.subject
+        server = str(call.server)
+        need = "call" if rule == "ask" or tool in file_server.COMMANDS else "window"
+        approval = call.approval
+        item = self.calls.get(approval.held) if approval is not None else None
+        if item is not None and item.subject != subject:
+            item = None
+        if approval is not None and item is None and need == "call":
+            raise Refused(
+                "That signature is not waiting here any more: it was used or turned down, or 30 "
+                "minutes passed. Ask again."
+            )
+        # A window's item gone means it was used: the window decides, as for
+        # any call.
+        if approval is not None and item is not None:
+            if item.kind == "call" and not item.matches(server, tool, arguments):
+                raise Refused("That signature is for another call. Ask again.")
+            if approval.signature is not None and item.signed is None:
+                await self._sign_with_passkey(item, approval)
+            if item.signed is None:
+                raise Held(self._held_answer(item, call), poll=True)
+            self.calls.remove(item.id)
+            if item.kind == "call":
+                return item.signed
+        window = self.calls.window(subject)
+        if need == "window" and window is not None:
+            return f"In the window {window.signed[0].lower()}{window.signed[1:]}."
+        if need == "call":
+            item = self._hold_call(
+                subject, "call", call_args(server, tool, arguments), target, tool
+            )
+        else:
+            item = self._hold_call(subject, "window", window_args(), target, tool)
+        raise Held(self._held_answer(item, call))
+
+    def _hold_call(
+        self, subject: str, kind: str, args: dict[str, Any], target: Target, tool: str
+    ) -> Pending:
+        words = (
+            self._call_words(subject, target, tool, args.get("arguments"))
+            if kind == "call"
+            else self._window_words()
+        )
+        try:
+            return self.calls.hold(subject, kind, args, words)
+        except TooMany as exc:
+            raise Refused(str(exc)) from None
+
+    async def _sign_with_passkey(self, item: Pending, approval: SiteCallApproval) -> None:
+        """A held call or window signed in Workbench with one of the person's
+        passkeys: checked as `held.approve` checks a held change (J14a.3)."""
+        fields = (
+            approval.envelope,
+            approval.key,
+            approval.credentialId,
+            approval.authenticatorData,
+            approval.clientDataJSON,
+            approval.signature,
+        )
+        if any(value is None for value in fields):
+            raise Refused("This signature is incomplete. Sign again in Workbench.")
+        assert approval.envelope is not None and approval.key is not None
+        async with self.lock:
+            if item.signed is not None or self.calls.get(item.id) is None:
+                return
+            enrollment = self.identity.load()
+            if enrollment is None:
+                raise Refused("This machine has not joined yet.")
+            found = next((p for p in self.passkeys_of(item.subject) if p.id == approval.key), None)
+            try:
+                if found is None:
+                    raise signing.NotSigned(
+                        "That passkey is not one of yours here. Pair it again with a code from "
+                        "the machine."
+                    )
+                count = pk.verify_assertion(
+                    found,
+                    approval.envelope,
+                    credential_id=str(approval.credentialId),
+                    authenticator_data=str(approval.authenticatorData),
+                    client_data_json=str(approval.clientDataJSON),
+                    signature=str(approval.signature),
+                )
+                seq = signing.check_envelope(
+                    approval.envelope,
+                    site=enrollment.site,
+                    enrolled_at=enrollment.enrolledAt,
+                    person=item.subject,
+                    act=item.act,
+                    args=item.args,
+                    key=approval.key,
+                    last_seq=self.sequence.last(item.subject),
+                )
+                # Spent before anything runs: one signature, one try.
+                self.sequence.accept(item.subject, seq)
+                self.passkeys.counted(found.id, count)
+            except signing.NotSigned as exc:
+                raise Refused(str(exc)) from None
+            self.calls.sign(item, f"Signed from Workbench with passkey {found.id[:8]}")
+
+    def _held_answer(self, item: Pending, call: SiteCall) -> dict[str, Any]:
+        """`held` with what to sign: the site's words, and an envelope for
+        each of the person's passkeys."""
+        subject = item.subject
+        enrollment = self.identity.load()
+        envelopes: dict[str, str] = {}
+        if enrollment is not None:
+            seq = self.sequence.last(subject) + 1
+            for passkey in self.passkeys_of(subject):
+                envelopes[passkey.id] = signing.envelope(
+                    site=enrollment.site,
+                    enrolled_at=enrollment.enrolledAt,
+                    person=subject,
+                    key=passkey.id,
+                    act=item.act,
+                    args=item.args,
+                    seq=seq,
+                )
+        where = self._at_the_machine()
+        if item.kind == "window":
+            message = (
+                f"Your allowed tools on {self._machine()} run once you open a window with your "
+                f"key: sign it {where}, or from Workbench with a passkey."
+            )
+        else:
+            message = (
+                f"This call runs once you sign it with your key: {where}, or from Workbench "
+                "with a passkey."
+            )
+        held: dict[str, Any] = {
+            "id": item.id,
+            "kind": item.kind,
+            "words": item.words,
+            "expiresAt": _iso(item.expires_at),
+            "approved": item.signed is not None,
+            "envelopes": envelopes,
+            "approvePage": self.approve_page(),
+        }
+        if item.kind == "window":
+            held["minutes"] = item.args.get("minutes")
+        return {
+            "status": "held",
+            "message": message,
+            "held": held,
+            **self._window_view(True, call),
+        }
+
+    def _call_words(self, subject: str, target: Target, tool: str, arguments: Any) -> list[str]:
+        """One call, in this site's own words, as the person signs it."""
+        link = self.links.for_subject(subject)
+        account = link.account_name if link else "your account"
+        machine = self._machine()
+        given = dict(arguments) if isinstance(arguments, dict) else {}
+        folder = given.pop("folder", None)
+        where = f"“{folder}”" if isinstance(folder, str) else target.name
+        if tool == "run_command":
+            path = given.get("path")
+            start = f"{where}" + (f", in {path}" if isinstance(path, str) and path != "." else "")
+            text = str(given.get("command", ""))
+            lines = text.splitlines() or [text]
+            shown = [line[:1000] for line in lines[:40]]
+            if len(lines) > 40:
+                shown.append(f"… {len(lines) - 40} more lines")
+            return [
+                f"Run this command on {machine} as {account}, starting in {start}:",
+                *shown,
+                f"It runs in {_shell_words()} and can do whatever {account} can, not only in "
+                "that folder.",
+            ]
+        if tool == "write_text" and isinstance(given.get("text"), str):
+            text = given.pop("text")
+            body = (
+                text if len(text) <= 900 else text[:900] + f"… ({len(text) - 900} more characters)"
+            )
+            return [
+                f"Write the file {given.get('path')} in {where} on {machine}, as {account}:",
+                *body.splitlines()[:40],
+            ]
+        details = signing.canonical(given)
+        if len(details) > 900:
+            details = details[:900] + "…"
+        return [f"{tool} in {where} on {machine}, as {account}:", details]
+
+    def _window_words(self) -> list[str]:
+        return [
+            f"Let Workbench use the tools your rules allow on {self._machine()} for 60 minutes, "
+            "without your signature each time: reading and searching your workspaces, and "
+            "anything else you set to allow.",
+            "Commands, and anything your rules say to ask about, still need your signature each "
+            "time.",
+            "You can close it from Workbench at any time.",
+        ]
 
     @staticmethod
     def _reader(target: Target, arguments: Any) -> str | None:
@@ -563,13 +859,22 @@ class Host:
                         "You may read workspaces here but not change files in them. Their "
                         "holder's rules decide that, in Workbench (Job sites)."
                     )
+                if tool in file_server.COMMAND_TOOLS:
+                    raise Refused(self._no_commands(target))
                 raise Refused(f"You may not use {tool!r} on {target.name}.")
+            if tool in file_server.HANDLES:
+                # It follows a command this person started, in their own worker.
+                return "allow"
             if not isinstance(name, str) or name not in target.folders:
                 raise Refused(f"You have no workspace named {name!r} on this machine.")
+            if tool in file_server.COMMANDS and name not in target.commandable:
+                raise Refused(f"In {name} you may not run commands: its rules say so.")
             group = group_of(tool)
-            decision = target.rules[name][group] if group else "deny"
+            decision = target.rules[name].get(group, "deny") if group else "deny"
             if decision == "deny":
-                what = "change files" if group == "change" else "read or search"
+                what = {"change": "change files", "command": "run commands"}.get(
+                    str(group), "read or search"
+                )
                 raise Refused(f"In {name} you may not {what}: its rules say so.")
             return decision
         if not isinstance(tool, str) or tool not in target.allowed:
@@ -636,7 +941,7 @@ class Host:
             for name, workspace, rules, mine in view
             if linked or not mine
         ]
-        target = self._files_target(subject, rows)
+        target = self._files_target(subject, rows, commands=self._commands_for(subject))
         # What the filter left out is theirs, opened only by their own worker:
         # it says to link, whatever their keys' state.
         kept = {name for name, *_ in rows}
@@ -645,19 +950,49 @@ class Host:
                 target.blocked[name] = (self._not_linked(), str(workspace["holder"]))
         return target
 
+    def _commands_for(self, subject: str) -> bool:
+        """Whether `subject` may be offered commands at all: an administrator
+        consented here (J89), and they have a key, so each command is signed
+        (J85)."""
+        return self._keyed(subject) and self.consent.allowed()
+
+    def _no_commands(self, target: Target) -> str:
+        """Why a person is not offered commands here, in words for them."""
+        state = self.consent.state()
+        if not state.allowed:
+            return self._commands_reason(state)
+        return (
+            f"You may not run commands on {self._machine()}. They run in your own workspaces "
+            "whose rules say to ask, once you have your own key there."
+        )
+
+    def _commands_reason(self, state: Any) -> str:
+        machine = self._machine()
+        how = (
+            "An administrator allows them at the machine: on Windows with Allow commands in "
+            "Eugene's tray icon, on Linux or macOS by running Eugene's install command again."
+        )
+        if state.withdrawn_at:
+            return f"{machine}'s owner turned commands off from Workbench. {how}"
+        return f"An administrator has not allowed commands on {machine}. {how}"
+
     def _files_target(
-        self, caller: str, rows: list[tuple[str, dict[str, Any], dict[str, str], str | None]]
+        self,
+        caller: str,
+        rows: list[tuple[str, dict[str, Any], dict[str, str], str | None]],
+        commands: bool = False,
     ) -> Target:
         """The file server for one caller: `rows` is each workspace in their
         view, by its name there, with their rules in it per group and whose
-        approval it runs under (J79)."""
+        approval it runs under (J79). With `commands`, the caller's own
+        workspaces whose rules ask about commands take them (J88)."""
         folders: dict[str, dict[str, Any]] = {}
         rules: dict[str, dict[str, str]] = {}
         blocked: dict[str, tuple[str, str]] = {}
         # Each approver's state once a call: it reads the links and passkeys.
         reasons: dict[str | None, str | None] = {None: "This machine has no owner."}
         for name, workspace, groups, approver in rows:
-            if all(groups[g] == "deny" for g in GROUPS):
+            if all(groups.get(g, "deny") == "deny" for g in GROUPS):
                 continue
             if approver not in reasons:
                 reasons[approver] = self._unapproved(str(approver), caller)
@@ -669,7 +1004,15 @@ class Host:
             rules[name] = groups
         readable = [n for n in folders if rules[n]["read"] != "deny"]
         writable = [n for n in folders if rules[n]["change"] != "deny"]
-        offered = {t.name: t for t in file_server.tools(readable, writable)}
+        commandable = [
+            n
+            for n in folders
+            if commands
+            and folders[n]["holder"] == caller
+            and folders[n]["writable"]
+            and rules[n].get("command") == "ask"
+        ]
+        offered = {t.name: t for t in file_server.tools(readable, writable, commandable)}
         return Target(
             FILES,
             "this machine's file server",
@@ -683,10 +1026,12 @@ class Host:
                 },
                 "readable": readable,
                 "writable": writable,
+                "commandable": commandable,
             },
             folders,
             rules,
             blocked,
+            commandable,
         )
 
     def _owner_in_dev_mode(self, call: SiteCall) -> Target:
@@ -716,7 +1061,7 @@ class Host:
                 (
                     name,
                     workspace,
-                    {"read": "allow", "change": "allow" if writable else "deny"},
+                    {"read": "allow", "change": "allow" if writable else "deny", "command": "deny"},
                     owner,
                 )
             )
@@ -792,6 +1137,8 @@ class Host:
             "server.enable": self._server_enable,
             "settings.set": self._settings_set,
             "audit.read": self._audit_read,
+            "window.close": self._window_close,
+            "commands.withdraw": self._commands_withdraw,
         }
 
     @staticmethod
@@ -841,15 +1188,27 @@ class Host:
 
     @staticmethod
     def _groups(rules: SiteRules | None, writable: bool) -> dict[str, str]:
+        """A workspace's rules per group. Given rules without `command` deny
+        commands (an older Workbench); a new workspace with no rules given
+        asks before each one (J88)."""
         groups = (
-            {"read": rules.read.value, "change": rules.change.value}
+            {
+                "read": rules.read.value,
+                "change": rules.change.value,
+                "command": rules.command.value if rules.command is not None else "deny",
+            }
             if rules is not None
-            else default_groups(writable)
+            else default_groups(writable, commands=True)
         )
         if not writable and groups["change"] != "deny":
             raise Refused(
                 "Nobody may change files in a workspace registered read only. Set changing "
                 "files to deny."
+            )
+        if not writable and groups["command"] != "deny":
+            raise Refused(
+                "Commands cannot run in a workspace registered read only. Set running commands "
+                "to deny."
             )
         return groups
 
@@ -1114,6 +1473,27 @@ class Host:
         self.policy.set_owner_in_dev_mode(value.ownerInDevMode)
         return {"ownerInDevMode": value.ownerInDevMode}
 
+    async def _window_close(self, subject: str, arguments: dict[str, Any]) -> dict[str, Any]:
+        """Close the person's window now (J90): it only takes access away."""
+        self._parse(SiteWindowClose, arguments)
+        return {"closed": self.calls.close(subject)}
+
+    async def _commands_withdraw(self, subject: str, arguments: dict[str, Any]) -> dict[str, Any]:
+        """The site's owner takes back the consent to commands (J30, J89)."""
+        self._parse(SiteCommandsWithdraw, arguments)
+        self.consent.withdraw()
+        return self._commands_view()
+
+    def _commands_view(self) -> dict[str, Any]:
+        """`SiteCommands`: whether commands may run here, in this site's words."""
+        state = self.consent.state()
+        return {
+            "allowed": state.allowed,
+            "consentedAt": state.consented_at,
+            "withdrawnAt": state.withdrawn_at,
+            "reason": None if state.allowed else self._commands_reason(state),
+        }
+
     async def _audit_read(self, subject: str, arguments: dict[str, Any]) -> dict[str, Any]:
         """The lines that belong to `subject` (J80): the owner's include the
         lines from before each line had a reader."""
@@ -1202,7 +1582,7 @@ class Host:
         """Whether a change only takes access away (J51): it needs no
         signature, and less than the person approved is still theirs."""
         try:
-            if name in ("folder.remove", "workspace.remove"):
+            if name in ("folder.remove", "workspace.remove", "window.close", "commands.withdraw"):
                 return True
             if name == "server.enable":
                 return SiteServerEnable.model_validate(arguments).enabled is False
@@ -1214,7 +1594,7 @@ class Host:
                 if workspace is None or workspace["holder"] != subject:
                     return False
                 before = per_group(workspace["rules"], workspace["writable"])
-                after = {"read": rules.rules.read.value, "change": rules.rules.change.value}
+                after = self._groups(rules.rules, bool(workspace["writable"]))
                 kept = {p.root for p in rules.deny}
                 return (
                     not any(looser(after[g], before[g]) for g in GROUPS)
@@ -1240,7 +1620,7 @@ class Host:
                 }
                 for person, groups in people:
                     old = shared_before.get(person)
-                    if old is None or any(looser(groups[g], old[g]) for g in GROUPS):
+                    if old is None or any(looser(groups[g], old[g]) for g in SHARED_GROUPS):
                         return False
                 return True
             if name == "access.set":
@@ -1388,6 +1768,20 @@ class Host:
             )
 
         items: list[dict[str, Any]] = []
+        # Calls first, newest first (J14b): one waits while the person signs.
+        for pending in self.calls.for_subject(subject):
+            if pending.signed is not None:
+                continue
+            items.append(
+                {
+                    "id": pending.id,
+                    "action": pending.act,
+                    "words": pending.words,
+                    "heldAt": _iso(pending.held_at),
+                    "expiresAt": _iso(pending.expires_at),
+                    "envelope": envelope(pending.act, pending.args),
+                }
+            )
         if keys and not self.policy.approved(subject):
             items.append(
                 {
@@ -1484,6 +1878,9 @@ class Host:
         change is theirs, and the rules they confirm are their own."""
         if self.links.for_subject(subject) is None:
             raise NotHeld(subject)
+        pending = self.calls.get(ident)
+        if pending is not None:
+            return await self._sign_call(pending, subject, verify, how)
         owner = self._owner()
         held = None if ident == RULES else self.held.get(ident)
         if ident == RULES:
@@ -1539,7 +1936,80 @@ class Host:
         )
         return {"status": "done", "result": result}
 
+    async def _sign_call(
+        self,
+        pending: Pending,
+        subject: str,
+        verify: Callable[[str, str, str, dict[str, Any]], tuple[str, int]],
+        how: str,
+    ) -> dict[str, Any]:
+        """A held call or window signed with the person's key (J14b): a
+        window opens now; a call runs when Workbench sends it again (J86)."""
+        if pending.subject != subject:
+            raise NotHeld(pending.id)
+        entry: dict[str, Any] = {
+            "subject": subject,
+            "kind": "mcp",
+            "action": pending.act,
+            "arguments": pending.args,
+            "reader": subject,
+        }
+        if pending.kind == "call":
+            # The tool's own arguments, so a write's text is left out (J8).
+            entry["server"] = pending.args.get("server")
+            entry["tool"] = pending.args.get("tool")
+            entry["arguments"] = pending.args.get("arguments")
+        async with self.lock:
+            if pending.signed is not None or self.calls.get(pending.id) is None:
+                raise NotHeld(pending.id)
+            try:
+                enrollment = self.identity.load()
+                if enrollment is None:
+                    raise Refused("This machine has not joined yet.")
+                try:
+                    key_id, seq = verify(
+                        enrollment.site, enrollment.enrolledAt, pending.act, pending.args
+                    )
+                    self.sequence.accept(subject, seq)
+                except signing.NotSigned as exc:
+                    raise Refused(str(exc)) from None
+            except Refused as exc:
+                self.audit.record(**entry, decision="refused", reason=str(exc))
+                return {"status": "failed", "message": str(exc)}
+            signed = f"Signed {how} {key_id[:8]}"
+            self.calls.sign(pending, signed)
+        if pending.kind == "window":
+            window = self.calls.window(subject)
+            until = _iso(window.until) if window else None
+            self.audit.record(
+                **entry,
+                decision="allowed",
+                outcome="done",
+                reason=f"{signed}: a window open until {until}.",
+            )
+            return {"status": "done", "result": {"windowUntil": until}}
+        self.audit.record(
+            **entry,
+            decision="allowed",
+            outcome="held",
+            reason=f"{signed}. It runs when Workbench sends it again.",
+        )
+        return {"status": "done", "result": {}}
+
     def reject(self, ident: str, subject: str, where: str = "at the machine") -> None:
+        pending = self.calls.get(ident)
+        if pending is not None and pending.subject == subject:
+            self.calls.remove(ident)
+            self.audit.record(
+                subject=subject,
+                kind="mcp",
+                action=pending.act,
+                arguments=pending.args.get("arguments", pending.args),
+                decision="refused",
+                reason=f"Turned down {where}.",
+                reader=subject,
+            )
+            return
         held = self.held.get(ident)
         if held is None or held.subject != subject:
             raise NotHeld(ident)
@@ -1681,6 +2151,9 @@ class Host:
         self._linked_here(subject)
         if not self.passkeys.remove(subject, ident):
             raise NotHeld(ident)
+        # What it may have signed and not yet used goes with it, and the window
+        # it may have opened closes (J14b).
+        self.calls.forget(subject)
         self.audit.record(
             subject=subject,
             kind="manage",
@@ -1711,7 +2184,10 @@ class Host:
 
     @staticmethod
     def _rules_text(groups: dict[str, str]) -> str:
-        return f"read and search: {groups['read']}; change files: {groups['change']}"
+        text = f"read and search: {groups['read']}; change files: {groups['change']}"
+        if groups.get("command", "deny") != "deny":
+            text += f"; run commands: {groups['command']} (your signature for each one)"
+        return text
 
     def _words(self, held: signing.Held) -> list[str]:
         args, names = held.arguments, held.names
@@ -1736,7 +2212,7 @@ class Host:
                 label = (
                     f"“{workspace['name']}” ({workspace['path']})" if workspace else "a workspace"
                 )
-                groups = {"read": rules.rules.read.value, "change": rules.rules.change.value}
+                groups = self._groups(rules.rules, bool(workspace and workspace["writable"]))
                 return [
                     f"Your rules in {label}: {self._rules_text(groups)}.",
                     "Hidden from every tool: " + ", ".join(p.root for p in rules.deny)
@@ -1818,7 +2294,7 @@ class Host:
             what = self._rules_text(groups)
             if subject not in before:
                 what += " (new)"
-            elif any(looser(groups[g], before[subject][g]) for g in GROUPS):
+            elif any(looser(groups[g], before[subject][g]) for g in SHARED_GROUPS):
                 what += " (more than before)"
             lines.append(f"• {self._who(subject, names)}: {what}")
         kept = {subject for subject, _ in people}
@@ -1876,10 +2352,11 @@ class Host:
         return self.settings.unavailable() or self.workers.problem or self.links.problem
 
     def _shared_view(self, workspace: dict[str, Any]) -> list[dict[str, Any]]:
-        return [
-            {"subject": p["subject"], **per_group(p["rules"], workspace["writable"])}
-            for p in workspace["people"]
-        ]
+        views = []
+        for p in workspace["people"]:
+            groups = per_group(p["rules"], workspace["writable"])
+            views.append({"subject": p["subject"], **{g: groups[g] for g in SHARED_GROUPS}})
+        return views
 
     def _workspace_view(self, workspace: dict[str, Any]) -> dict[str, Any]:
         """`SiteWorkspace`: what the root keeps, never the path (J76)."""
@@ -1925,7 +2402,14 @@ class Host:
             "enabled": any_workspace,
             "available": any_workspace and reason is None,
             "reason": reason if any_workspace else "No workspace is registered on this machine.",
-            "tools": [tool_view(t) for t in file_server.tools(["workspace"], ["workspace"])],
+            "tools": [
+                tool_view(t)
+                for t in file_server.tools(
+                    ["workspace"],
+                    ["workspace"],
+                    ["workspace"] if self.consent.allowed() else [],
+                )
+            ],
         }
 
     def _server_view(self, server: str) -> dict[str, Any]:
@@ -1966,9 +2450,14 @@ class Host:
                     "keys": len(link.keys) + len(self.passkeys_of(link.subject)),
                     "signing": self.signing_state(link.subject),
                     "held": len(self.held.for_subject(link.subject)),
+                    "windowUntil": self._window_until(link.subject),
                 }
             )
         return views
+
+    def _window_until(self, subject: str) -> str | None:
+        window = self.calls.window(subject)
+        return _iso(window.until) if window else None
 
     def summary(self) -> dict[str, Any] | None:
         """What this site holds (`SiteSummary`), for its next poll; None
@@ -2004,6 +2493,7 @@ class Host:
                 "passkeys": True,
                 "people": True,
             },
+            "commands": self._commands_view(),
         }
 
     def _refresh_stale(self) -> None:

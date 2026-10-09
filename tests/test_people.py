@@ -46,6 +46,10 @@ def at(site: Site, here: str, bo_keys: list[PersonKey] | None = None) -> None:
     path = site.host.settings.links_file
     assert path is not None and site.key is not None
     me, away = site.account, OTHER_ACCOUNT
+    if bo_keys:
+        site.keys[BO] = bo_keys[0]
+    else:
+        site.keys.pop(BO, None)
     write_links(
         path,
         link_entry(ADA, me if here == ADA else away, "ada", [site.key]),
@@ -56,9 +60,14 @@ def at(site: Site, here: str, bo_keys: list[PersonKey] | None = None) -> None:
 
 
 async def call(
-    site: Site, subject: str, tool: str, asked: bool = False, **arguments: Any
+    site: Site,
+    subject: str,
+    tool: str,
+    asked: bool = False,
+    sign: bool = True,
+    **arguments: Any,
 ) -> dict[str, Any]:
-    return await site.host.mcp(
+    return await site.run(
         SiteCall.model_validate(
             {
                 "id": secrets.token_hex(8),
@@ -69,7 +78,8 @@ async def call(
                 "installMode": "production",
                 "asked": asked,
             }
-        )
+        ),
+        sign=sign,
     )
 
 
@@ -305,25 +315,28 @@ async def test_allow_runs_ask_needs_the_persons_word_and_deny_is_never_offered(
     assert enum(listed, "write_text") == ["Mine"]  # Notes is read-only for BO
     assert listed["write_text"]["_meta"][ASK_META] == ["Mine"]
     assert listed["read_text"]["_meta"][ASK_META] == []
-    refused = await call(
-        site, BO, "write_text", folder="Mine", path="new.txt", text="x", expectedSha256=""
-    )
-    assert refused["status"] == "failed" and "approval" in refused["message"]
-    assert not (mine / "new.txt").exists()
-    wrote = await call(
+    # BO has a key, so Workbench's word is not enough (J14b): held, unrun.
+    held = await call(
         site,
         BO,
         "write_text",
         asked=True,
+        sign=False,
         folder="Mine",
         path="new.txt",
         text="x",
         expectedSha256="",
     )
+    assert held["status"] == "held" and held["held"]["kind"] == "call", held
+    assert not (mine / "new.txt").exists()
+    wrote = await call(
+        site, BO, "write_text", folder="Mine", path="new.txt", text="x", expectedSha256=""
+    )
     assert result(wrote) and (mine / "new.txt").read_text(encoding="utf-8") == "x"
     lines = site.host.audit.newest(10, BO)
-    assert lines[0]["rule"] == "ask" and lines[0]["asked"] is True
-    assert lines[1]["rule"] == "ask" and lines[1]["asked"] is False
+    assert lines[0]["rule"] == "ask" and lines[0]["signed"].startswith("Signed at the machine")
+    assert lines[1]["action"] == "call" and lines[1]["outcome"] == "held"  # signed, not run
+    assert lines[2]["rule"] == "ask" and lines[2]["outcome"] == "held"
     denied = await call(
         site,
         BO,
