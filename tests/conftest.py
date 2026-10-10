@@ -281,6 +281,35 @@ class Site:
         assert held, answer
         return await self.approve(held[-1].id, subject)
 
+    async def add_workspace(
+        self, subject: str, *, name: str, path: str, writable: bool = False, **extra: Any
+    ) -> dict[str, Any]:
+        """The owner registers a workspace of their own: they read it without
+        asking, are asked before files change (nothing, when it is read only),
+        and run no commands in it."""
+        rules = {"read": "allow", "change": "ask" if writable else "deny", "command": "deny"}
+        return await self.manage(
+            subject, "workspace.add", name=name, path=path, writable=writable, rules=rules, **extra
+        )
+
+    async def share_workspace(
+        self, subject: str, *, id: str, people: list[tuple[str, bool]], **extra: Any
+    ) -> dict[str, Any]:
+        """The owner shares a workspace: each person but the owner (whose own
+        rules are the workspace's) reads it, and `True` lets them change files
+        without asking."""
+        return await self.manage(
+            subject,
+            "workspace.people",
+            id=id,
+            people=[
+                {"subject": who, "read": "allow", "change": "allow" if may else "deny"}
+                for who, may in people
+                if who != subject
+            ],
+            **extra,
+        )
+
     async def approve(self, ident: str, subject: str = ADA, key: PersonKey | None = None) -> Any:
         """Sign one listed item at the machine with `key` (the owner's)."""
         key = key or self.key

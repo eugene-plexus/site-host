@@ -48,17 +48,16 @@ def read(name: str = "Notes") -> dict[str, Any]:
 
 
 async def added(site: Site, folder: Path, *, writable: bool = False) -> str:
-    answer = await site.manage(ADA, "folder.add", name="Notes", path=str(folder), writable=writable)
+    answer = await site.add_workspace(ADA, name="Notes", path=str(folder), writable=writable)
     assert answer["status"] == "done", answer
     return str(answer["result"]["id"])
 
 
 async def people(site: Site, folder_id: str, *who: tuple[str, bool], **kw: Any) -> dict[str, Any]:
-    return await site.manage(
+    return await site.share_workspace(
         ADA,
-        "folder.people",
         id=folder_id,
-        people=[{"subject": s, "writable": w} for s, w in who],
+        people=list(who),
         **kw,
     )
 
@@ -103,7 +102,7 @@ def checked(key: PersonKey, text: str, **override: Any) -> signing.Checked:
         "site": ENROLLMENT.site,
         "enrolled_at": ENROLLMENT.enrolledAt,
         "person": ADA,
-        "act": "folder.add",
+        "act": "workspace.add",
         "args": {"name": "Notes", "path": "/x"},
         "keys": {key.id: signing.parse_key(key.id, *_alg_pub(key))},
         "key": key.id,
@@ -124,7 +123,7 @@ def envelope(key: PersonKey, **override: Any) -> str:
         "enrolled_at": ENROLLMENT.enrolledAt,
         "person": ADA,
         "key": key.id,
-        "act": "folder.add",
+        "act": "workspace.add",
         "args": {"name": "Notes", "path": "/x"},
         "seq": 1,
         **override,
@@ -157,7 +156,7 @@ def test_a_key_whose_id_is_not_its_own_is_no_key() -> None:
         ("site", "s-" + "b" * 26, "site differs"),
         ("enrolled_at", "2026-10-07T00:00:00+00:00", "enrolledAt differs"),
         ("person", BO, "person differs"),
-        ("act", "folder.people", "act differs"),
+        ("act", "workspace.people", "act differs"),
         ("args", {"name": "Notes", "path": "/elsewhere"}, "args differs"),
     ],
 )
@@ -203,7 +202,11 @@ def test_an_old_or_replayed_approval_is_refused() -> None:
 
 
 async def test_an_unsigned_site_says_so_and_runs_nothing(open_site: OpenSite, folder: Path) -> None:
-    site = await open_site(signed=False, link_page="http://127.0.0.1:8079/link")
+    site = await open_site(
+        signed=False,
+        link_page="http://127.0.0.1:8079/link",
+        approve_page="http://127.0.0.1:8079/link/approve",
+    )
     notes = await added(site, folder)  # root-trusted, as before J14a (J48)
     assert (await people(site, notes, (ADA, False)))["status"] == "done"
     refused = await site.mcp(ADA, FILES, "tools/call", read())
@@ -321,7 +324,7 @@ async def test_taking_access_away_needs_no_signature_and_keeps_the_rules_signed(
     assert off["status"] == "done"
     on = await site.manage(ADA, "settings.set", ownerInDevMode=True, approve=False)
     assert on["status"] == "held"
-    removed = await site.manage(ADA, "folder.remove", id=notes, approve=False)
+    removed = await site.manage(ADA, "workspace.remove", id=notes, approve=False)
     assert removed["status"] == "done" and site.host.signing_state() == "signed"
 
 
@@ -345,9 +348,7 @@ async def test_rules_from_before_the_key_are_approved_as_a_whole(
     )
     # The rules changed after they were listed: that approval is for other rules.
     stale_text = rules["envelope"]
-    assert (await site.manage(ADA, "folder.people", id=notes, people=[], approve=False))[
-        "status"
-    ] == "done"
+    assert (await site.share_workspace(ADA, id=notes, people=[], approve=False))["status"] == "done"
     stale = SiteApproval(
         subject=ADA, envelope=stale_text, key=key.id, signature=key.sign(stale_text)
     )
@@ -553,13 +554,13 @@ async def test_two_approvals_of_one_change_apply_it_once(site: Site, folder: Pat
     listed_seq = json.loads(first["envelope"])["seq"]
     second = first["envelope"].replace(f'"seq":{listed_seq}', f'"seq":{listed_seq + 1}')
     assert second != first["envelope"]
-    apply = site.host._folder_people
+    apply = site.host._workspace_people
 
     async def slowly(subject: str, arguments: dict[str, Any]) -> dict[str, Any]:
         await asyncio.sleep(0.05)
         return await apply(subject, arguments)
 
-    site.host._folder_people = slowly  # type: ignore[method-assign]
+    site.host._workspace_people = slowly  # type: ignore[method-assign]
     answers = await asyncio.gather(
         site.host.approve(item.id, approval(first["envelope"])),
         site.host.approve(item.id, approval(second)),
@@ -571,7 +572,7 @@ async def test_two_approvals_of_one_change_apply_it_once(site: Site, folder: Pat
         sum(
             1
             for e in site.host.audit.newest(20)
-            if e.get("outcome") == "done" and e.get("action") == "folder.people"
+            if e.get("outcome") == "done" and e.get("action") == "workspace.people"
         )
         == 1
     )

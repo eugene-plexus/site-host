@@ -171,7 +171,7 @@ def names(site: Site) -> list[str]:
 
 async def with_rules(site: Site, folder: Path) -> None:
     """A rule made before any key, on the root's word (an unsigned site)."""
-    made = await site.manage(ADA, "folder.add", name="Notes", path=str(folder))
+    made = await site.add_workspace(ADA, name="Notes", path=str(folder))
     assert made["status"] == "done", made
 
 
@@ -199,7 +199,7 @@ async def test_a_paired_passkey_approves_the_rules_and_a_held_change(
     assert (await approve(bare, passkey, RULES))["status"] == "done"
     assert bare.host.signing_state() == "signed"
     other = other_folder(tmp_path)
-    added = await bare.manage(ADA, "folder.add", name="Other", path=str(other), approve=False)
+    added = await bare.add_workspace(ADA, name="Other", path=str(other), approve=False)
     assert added["status"] == "held"
     ident = bare.host.held.for_subject(ADA)[0].id
     done = await approve(bare, passkey, ident)
@@ -355,7 +355,7 @@ async def ready(bare: Site, folder: Path, tmp_path: Path) -> tuple[Site, Authent
     assert (await paired(bare, passkey))["status"] == "done"
     assert (await approve(bare, passkey, RULES))["status"] == "done"
     other = other_folder(tmp_path)
-    held = await bare.manage(ADA, "folder.add", name="Other", path=str(other), approve=False)
+    held = await bare.add_workspace(ADA, name="Other", path=str(other), approve=False)
     assert held["status"] == "held", held
     return bare, passkey, bare.host.held.for_subject(ADA)[0].id
 
@@ -419,7 +419,7 @@ async def test_a_passkey_that_does_not_count_is_taken(
     await paired(bare, passkey)
     assert (await approve(bare, passkey, RULES))["status"] == "done"
     other = other_folder(tmp_path)
-    await bare.manage(ADA, "folder.add", name="Other", path=str(other), approve=False)
+    await bare.add_workspace(ADA, name="Other", path=str(other), approve=False)
     ident = bare.host.held.for_subject(ADA)[0].id
     assert (await approve(bare, passkey, ident))["status"] == "done"
 
@@ -433,7 +433,7 @@ async def test_a_used_passkey_approval_cannot_be_replayed(
     signed = passkey.approve(ident, envelope)
     assert (await site.manage(ADA, "held.approve", **signed))["status"] == "done"
     third = other_folder(tmp_path, "third")
-    await site.manage(ADA, "folder.add", name="Third", path=str(third), approve=False)
+    await site.add_workspace(ADA, name="Third", path=str(third), approve=False)
     again = site.host.held.for_subject(ADA)[0].id
     replayed = await site.manage(ADA, "held.approve", **{**signed, "id": again})
     assert replayed["status"] == "failed"
@@ -452,14 +452,14 @@ async def test_an_old_passkey_approval_of_the_same_change_is_spent(
     await paired(bare, passkey)
     assert (await approve(bare, passkey, RULES))["status"] == "done"
     other = other_folder(tmp_path)
-    await bare.manage(ADA, "folder.add", name="Other", path=str(other), approve=False)
+    await bare.add_workspace(ADA, name="Other", path=str(other), approve=False)
     first = bare.host.held.for_subject(ADA)[0].id
     items = (await listed(bare, passkey))["items"]
     signed = passkey.approve(first, next(i for i in items if i["id"] == first)["envelope"])
     assert (await bare.manage(ADA, "held.approve", **signed))["status"] == "done"
     gone = next(f["id"] for f in bare.host.policy.folders if f["name"] == "Other")
-    assert (await bare.manage(ADA, "folder.remove", id=gone))["status"] == "done"
-    await bare.manage(ADA, "folder.add", name="Other", path=str(other), approve=False)
+    assert (await bare.manage(ADA, "workspace.remove", id=gone))["status"] == "done"
+    await bare.add_workspace(ADA, name="Other", path=str(other), approve=False)
     again = bare.host.held.for_subject(ADA)[0].id
     replayed = await bare.manage(ADA, "held.approve", **{**signed, "id": again})
     assert replayed["status"] == "failed", replayed
@@ -472,7 +472,7 @@ async def test_the_envelope_signed_must_be_this_change(
 ) -> None:
     site, passkey, ident = ready
     third = other_folder(tmp_path, "third")
-    await site.manage(ADA, "folder.add", name="Third", path=str(third), approve=False)
+    await site.add_workspace(ADA, name="Third", path=str(third), approve=False)
     items = (await listed(site, passkey))["items"]
     second = next(i for i in items if i["id"] != ident)
     # A valid assertion over the other held change's envelope, sent for this one.
@@ -606,7 +606,7 @@ async def test_a_passkey_removed_from_workbench_approves_nothing_and_its_grants_
     again = await site.manage(ADA, "passkey.remove", id=passkey.id)
     assert again["status"] == "failed" and "not paired with this machine" in again["message"]
     third_folder = other_folder(tmp_path, "third")
-    held = await site.manage(ADA, "folder.add", name="Third", path=str(third_folder), approve=False)
+    held = await site.add_workspace(ADA, name="Third", path=str(third_folder), approve=False)
     assert held["status"] == "held"
     third = site.host.held.for_subject(ADA)[0].id
     items = (await listed(site, spare))["items"]
@@ -626,9 +626,7 @@ async def test_removing_the_last_key_from_workbench_stops_every_tool(
     assert (await site.manage(ADA, "passkey.remove", id=passkey.id))["status"] == "done"
     assert site.host.signing_state() == "unsigned"
     later = other_folder(tmp_path, "later")
-    assert (await site.manage(ADA, "folder.add", name="Later", path=str(later)))["status"] == (
-        "done"
-    )
+    assert (await site.add_workspace(ADA, name="Later", path=str(later)))["status"] == ("done")
     fresh = Authenticator()
     assert (await paired(site, fresh))["status"] == "done"
     assert site.host.signing_state() == "unconfirmed"

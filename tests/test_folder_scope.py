@@ -19,11 +19,9 @@ async def granted(
     open_site: OpenSite, tmp_path: Path, root: Path, *, protected: tuple[Path, ...] = ()
 ) -> Any:
     site = await open_site(tmp_path, protected=(tmp_path / "data", *protected))
-    found = await site.manage(ADA, "folder.add", name="Shared", path=str(root), writable=True)
+    found = await site.add_workspace(ADA, name="Shared", path=str(root), writable=True)
     assert found["status"] == "done", found
-    given = await site.manage(
-        ADA, "folder.people", id=found["result"]["id"], people=[{"subject": BO, "writable": True}]
-    )
+    given = await site.share_workspace(ADA, id=found["result"]["id"], people=[(BO, True)])
     assert given["status"] == "done", given
     grants: list[dict[str, Any]] = []
 
@@ -101,7 +99,7 @@ async def test_a_protected_root_and_hard_links_are_refused(
     secret.mkdir()
     (secret / "node.yaml").write_text("secret", encoding="utf-8")
     site = await open_site(tmp_path, protected=(tmp_path / "data", secret))
-    around = await site.manage(ADA, "folder.add", name="Around", path=str(tmp_path))
+    around = await site.add_workspace(ADA, name="Around", path=str(tmp_path))
     assert around["status"] == "failed", around
     shared = tmp_path / "shared"
     shared.mkdir()

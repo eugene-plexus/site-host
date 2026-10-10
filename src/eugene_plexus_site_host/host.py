@@ -78,9 +78,6 @@ from ._generated.models import (
     SiteCallApproval,
     SiteCommandsWithdraw,
     SiteDenyPattern,
-    SiteFolderAdd,
-    SiteFolderPeople,
-    SiteFolderRemove,
     SiteHeldListRequest,
     SiteHeldRejectRequest,
     SiteLocalServer,
@@ -195,9 +192,6 @@ OWNER_ACTIONS = frozenset(
         "access.set",
         "server.enable",
         "settings.set",
-        "folder.add",
-        "folder.remove",
-        "folder.people",
         "commands.withdraw",
     }
 )
@@ -1130,9 +1124,6 @@ class Host:
             "workspace.people": self._workspace_people,
             "rules.set": self._rules_set,
             "workspace.list": self._workspace_list,
-            "folder.add": self._folder_add,
-            "folder.remove": self._folder_remove,
-            "folder.people": self._folder_people,
             "access.set": self._access_set,
             "server.enable": self._server_enable,
             "settings.set": self._settings_set,
@@ -1188,9 +1179,9 @@ class Host:
 
     @staticmethod
     def _groups(rules: SiteRules | None, writable: bool) -> dict[str, str]:
-        """A workspace's rules per group. Given rules without `command` deny
-        commands (an older Workbench); a new workspace with no rules given
-        asks before each one (J88)."""
+        """A workspace's rules per group. A group the rules do not name is
+        denied (`command` is optional in `SiteRules`); a new workspace with no
+        rules given asks before each command (J88)."""
         groups = (
             {
                 "read": rules.read.value,
@@ -1355,46 +1346,6 @@ class Host:
         self._parse(SiteWorkspaceListRequest, arguments)
         return {"workspaces": [self._workspace_detail(w) for w in self.policy.own(subject)]}
 
-    # --- the owner's, for a root from before 2b.3b ------------------------------------
-
-    async def _folder_add(self, subject: str, arguments: dict[str, Any]) -> dict[str, Any]:
-        value = self._parse(SiteFolderAdd, arguments)
-        writable = bool(value.writable)
-        workspace = await self._add(
-            subject, value.name, value.path, writable, default_groups(writable), []
-        )
-        return self._folder_view(workspace)
-
-    async def _folder_remove(self, subject: str, arguments: dict[str, Any]) -> dict[str, Any]:
-        value = self._parse(SiteFolderRemove, arguments)
-        workspace = self.policy.workspace(value.id)
-        if workspace is None or workspace["holder"] != subject:
-            raise Refused("This folder is no longer registered.")
-        self.policy.remove_workspace(value.id)
-        return {"id": value.id}
-
-    @staticmethod
-    def _folder_groups(
-        value: SiteFolderPeople, owner: str | None
-    ) -> list[tuple[str, dict[str, str]]]:
-        """An older root's list as rules: changing files was a standing
-        pre-approval, so it reads `allow`. The owner, whom J11 put on their
-        own lists, has rules of their own now."""
-        return [
-            (p.subject, {"read": "allow", "change": "allow" if p.writable else "deny"})
-            for p in value.people
-            if p.subject != owner
-        ]
-
-    async def _folder_people(self, subject: str, arguments: dict[str, Any]) -> dict[str, Any]:
-        value = self._parse(SiteFolderPeople, arguments)
-        workspace = self.policy.workspace(value.id)
-        if workspace is None or workspace["holder"] != subject:
-            raise Refused("This folder is no longer registered.")
-        people = self._shares(workspace, self._folder_groups(value, subject))
-        self.policy.set_people(value.id, people)
-        return self._folder_view(workspace)
-
     # --- the owner's: local servers and settings ---------------------------------------
 
     async def _offered(self, server: str) -> tuple[str, dict[str, types.Tool]]:
@@ -1538,11 +1489,7 @@ class Host:
         return "signed" if self.policy.approved(person) else "unconfirmed"
 
     def approve_page(self) -> str | None:
-        if self.settings.approve_page:
-            return self.settings.approve_page
-        # An agent from before J14a.2 named only the link page.
-        page = self.settings.link_page
-        return f"{page.rstrip('/')}/approve" if page else None
+        return self.settings.approve_page or None
 
     def _at_the_machine(self) -> str:
         page = self.approve_page()
@@ -1582,7 +1529,7 @@ class Host:
         """Whether a change only takes access away (J51): it needs no
         signature, and less than the person approved is still theirs."""
         try:
-            if name in ("folder.remove", "workspace.remove", "window.close", "commands.withdraw"):
+            if name in ("workspace.remove", "window.close", "commands.withdraw"):
                 return True
             if name == "server.enable":
                 return SiteServerEnable.model_validate(arguments).enabled is False
@@ -1600,18 +1547,13 @@ class Host:
                     not any(looser(after[g], before[g]) for g in GROUPS)
                     and set(workspace["deny"]) <= kept
                 )
-            if name in ("workspace.people", "folder.people"):
-                if name == "folder.people":
-                    folder = SiteFolderPeople.model_validate(arguments)
-                    workspace_id, people = folder.id, self._folder_groups(folder, subject)
-                else:
-                    shared = SiteWorkspacePeople.model_validate(arguments)
-                    workspace_id = shared.id
-                    people = [
-                        (p.subject, {"read": p.read.value, "change": p.change.value})
-                        for p in shared.people
-                    ]
-                workspace = self.policy.workspace(workspace_id)
+            if name == "workspace.people":
+                shared = SiteWorkspacePeople.model_validate(arguments)
+                people = [
+                    (p.subject, {"read": p.read.value, "change": p.change.value})
+                    for p in shared.people
+                ]
+                workspace = self.policy.workspace(shared.id)
                 if workspace is None or workspace["holder"] != subject:
                     return False
                 shared_before = {
@@ -1678,9 +1620,6 @@ class Host:
             self._new_workspace(subject, add.name, add.path)
             self._groups(add.rules, writable)
             self._deny(add.deny)
-        elif name == "folder.add":
-            folder = self._parse(SiteFolderAdd, arguments)
-            self._new_workspace(subject, folder.name, folder.path)
         elif name == "rules.set":
             rules = self._parse(SiteRulesSet, arguments)
             workspace = self._own_workspace(subject, rules.id)
@@ -1696,12 +1635,6 @@ class Host:
                     for p in shared.people
                 ],
             )
-        elif name == "folder.people":
-            listed = self._parse(SiteFolderPeople, arguments)
-            folder_of = self.policy.workspace(listed.id)
-            if folder_of is None or folder_of["holder"] != subject:
-                raise Refused("This folder is no longer registered.")
-            self._shares(folder_of, self._folder_groups(listed, subject))
         elif name == "access.set":
             access = self._parse(SiteAccessSet, arguments)
             server = str(access.server)
@@ -1734,7 +1667,7 @@ class Host:
 
     @staticmethod
     def _named(name: str, arguments: dict[str, Any]) -> set[str]:
-        shares = ("folder.people", "access.set", "workspace.people")
+        shares = ("access.set", "workspace.people")
         people = arguments.get("people") if name in shares else None
         if not isinstance(people, list):
             return set()
@@ -2229,20 +2162,6 @@ class Host:
                     ],
                     names,
                 )
-            if held.action == "folder.add":
-                add_folder = SiteFolderAdd.model_validate(args)
-                return [
-                    f"Add the folder {add_folder.path.strip()} as “{add_folder.name.strip()}”.",
-                    "You may read it without asking, and are asked before files change."
-                    if add_folder.writable
-                    else "It is read only: nobody may change files in it.",
-                    "Nobody else may use it until you say who.",
-                ]
-            if held.action == "folder.people":
-                folder = SiteFolderPeople.model_validate(args)
-                return self._people_words(
-                    folder.id, self._folder_groups(folder, held.subject), names
-                )
             if held.action == "access.set":
                 access = SiteAccessSet.model_validate(args)
                 local = self.local.entries.get(str(access.server))
@@ -2375,21 +2294,6 @@ class Host:
             **self._workspace_view(workspace),
             "path": workspace["path"],
             "deny": list(workspace["deny"]),
-        }
-
-    def _folder_view(self, workspace: dict[str, Any]) -> dict[str, Any]:
-        """`SiteFolder`, for a root from before 2b.3b."""
-        names = {w["id"]: name for name, w, _, _ in self.policy.view(str(workspace["holder"]))}
-        return {
-            "id": workspace["id"],
-            "name": names.get(workspace["id"], workspace["name"]),
-            "path": workspace["path"],
-            "identity": workspace["identity"],
-            "writable": workspace["writable"],
-            "people": [
-                {"subject": p["subject"], "writable": p["change"] != "deny"}
-                for p in self._shared_view(workspace)
-            ],
         }
 
     def _files_view(self, reason: str | None) -> dict[str, Any]:

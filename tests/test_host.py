@@ -20,18 +20,17 @@ FILES = "files"
 
 
 async def add(site: Site, folder: Path, *, name: str = "Notes", writable: bool = False) -> str:
-    added = await site.manage(ADA, "folder.add", name=name, path=str(folder), writable=writable)
+    added = await site.add_workspace(ADA, name=name, path=str(folder), writable=writable)
     assert added["status"] == "done", added
     assert added["result"]["people"] == []
     return str(added["result"]["id"])
 
 
 async def give(site: Site, folder_id: str, *people: tuple[str, bool]) -> dict[str, Any]:
-    answer = await site.manage(
+    answer = await site.share_workspace(
         ADA,
-        "folder.people",
         id=folder_id,
-        people=[{"subject": s, "writable": w} for s, w in people],
+        people=list(people),
     )
     assert answer["status"] == "done", answer
     return answer
@@ -128,9 +127,7 @@ async def test_a_reader_is_told_plainly_they_may_not_change_files(site: Site, fo
 
 async def test_a_read_only_folder_takes_no_writer(site: Site, folder: Path) -> None:
     notes = await add(site, folder, writable=False)
-    refused = await site.manage(
-        ADA, "folder.people", id=notes, people=[{"subject": BO, "writable": True}]
-    )
+    refused = await site.share_workspace(ADA, id=notes, people=[(BO, True)])
     assert refused["status"] == "failed" and "read-only" in refused["message"]
 
 
@@ -150,7 +147,7 @@ async def test_a_folder_name_is_unique_on_the_machine(
     other = tmp_path / "other"
     other.mkdir()
     await add(site, folder)
-    again = await site.manage(ADA, "folder.add", name="notes", path=str(other))
+    again = await site.add_workspace(ADA, name="notes", path=str(other))
     assert again["status"] == "failed" and "named notes already" in again["message"]
 
 
@@ -188,9 +185,9 @@ async def test_an_owner_named_in_the_environment_is_not_the_owner(
     environment names, only the person the join pinned manages it."""
     monkeypatch.setenv("SITE_HOST_OWNER", BO)
     monkeypatch.setenv("EUGENE_PLEXUS_SITE_OWNER", BO)
-    refused = await site.manage(BO, "folder.add", name="X", path=str(folder))
+    refused = await site.manage(BO, "settings.set", ownerInDevMode=True)
     assert refused["status"] == "failed" and "Only this machine's owner" in refused["message"]
-    assert (await site.manage(ADA, "folder.add", name="X", path=str(folder)))["status"] == "done"
+    assert (await site.add_workspace(ADA, name="X", path=str(folder)))["status"] == "done"
 
 
 async def test_editing_the_root_is_not_enough(site: Site, folder: Path) -> None:
@@ -198,17 +195,13 @@ async def test_editing_the_root_is_not_enough(site: Site, folder: Path) -> None:
     and every other person are refused, whatever the root says."""
     notes = await add(site, folder)
     for subject in ("operator", BO):
-        refused = await site.manage(
-            subject, "folder.people", id=notes, people=[{"subject": BO, "writable": False}]
-        )
+        refused = await site.share_workspace(subject, id=notes, people=[(BO, False)])
         assert refused["status"] == "failed" and "Only this machine's owner" in refused["message"]
-        refused = await site.manage(subject, "folder.add", name="X", path=str(folder))
-        assert refused["status"] == "failed"
+        refused = await site.manage(subject, "settings.set", ownerInDevMode=True)
+        assert refused["status"] == "failed" and "Only this machine's owner" in refused["message"]
     still = await site.mcp(BO, FILES, "tools/call", read())
     assert still["status"] == "failed"
-    operator = await site.manage(
-        ADA, "folder.people", id=notes, people=[{"subject": "operator", "writable": False}]
-    )
+    operator = await site.share_workspace(ADA, id=notes, people=[("operator", False)])
     assert operator["status"] == "failed" and "not a person here" in operator["message"]
 
 
@@ -228,7 +221,7 @@ async def test_the_list_survives_a_restart_and_is_the_sites_own_file(
 async def test_removing_a_folder_takes_its_grants_with_it(site: Site, folder: Path) -> None:
     notes = await add(site, folder)
     await give(site, notes, (BO, False))
-    assert (await site.manage(ADA, "folder.remove", id=notes))["status"] == "done"
+    assert (await site.manage(ADA, "workspace.remove", id=notes))["status"] == "done"
     await add(site, folder)
     assert (await site.mcp(BO, FILES, "tools/call", read()))["status"] == "failed"
 
@@ -331,7 +324,7 @@ async def test_a_site_with_no_channel_for_its_workers_runs_nothing(
     host = Host(settings_for(tmp_path, channel=None))
     await host.start()
     site = Site(host)
-    refused = await site.manage(ADA, "folder.add", name="Notes", path=str(folder))
+    refused = await site.add_workspace(ADA, name="Notes", path=str(folder))
     assert refused["status"] == "failed" and "no channel for its workers" in refused["message"]
     assert host.settings.unavailable() is not None and host.workers.problem is not None
     assert host.reason() is not None

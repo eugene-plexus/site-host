@@ -69,14 +69,13 @@ def record_calls(site: Site) -> list[str]:
 
 async def shared(site: Site, folder: Path, *people: str) -> str:
     """The owner registers `folder` as Notes and lets `people` read it."""
-    added = await site.manage(ADA, "folder.add", name="Notes", path=str(folder))
+    added = await site.add_workspace(ADA, name="Notes", path=str(folder))
     assert added["status"] == "done", added
     folder_id = str(added["result"]["id"])
-    given = await site.manage(
+    given = await site.share_workspace(
         ADA,
-        "folder.people",
         id=folder_id,
-        people=[{"subject": s, "writable": False} for s in people],
+        people=[(s, False) for s in people],
     )
     assert given["status"] == "done", given
     return folder_id
@@ -224,9 +223,7 @@ async def test_no_sharing_means_only_the_owner_is_served(open_site: OpenSite, fo
         "status"
     ] == "done"
     # Nobody but the owner can be given a folder or a server where sharing is off.
-    refused = await site.manage(
-        ADA, "folder.people", id=folder_id, people=[{"subject": BO, "writable": False}]
-    )
+    refused = await site.share_workspace(ADA, id=folder_id, people=[(BO, False)])
     assert refused["status"] == "failed" and "serves only its owner" in refused["message"]
     refused = await site.manage(
         ADA,
@@ -236,9 +233,7 @@ async def test_no_sharing_means_only_the_owner_is_served(open_site: OpenSite, fo
     )
     assert refused["status"] == "failed" and "serves only its owner" in refused["message"]
     # The owner may be granted, and their call runs.
-    given = await site.manage(
-        ADA, "folder.people", id=folder_id, people=[{"subject": ADA, "writable": False}]
-    )
+    given = await site.share_workspace(ADA, id=folder_id, people=[(ADA, False)])
     assert given["status"] == "done", given
     got = await site.mcp(ADA, FILES, "tools/call", read())
     assert got["status"] == "done", got
@@ -313,7 +308,7 @@ async def test_folder_add_names_the_account_when_the_worker_cannot_open_it(
     site = await open_site(worker=False)
     fake = FakeWorker(site, lambda _m: {"ok": True, "problem": problem})
     await fake.start()
-    refused = await site.manage(ADA, "folder.add", name="Notes", path=str(folder))
+    refused = await site.add_workspace(ADA, name="Notes", path=str(folder))
     await fake.stop()
     assert refused["status"] == "failed" and expected in refused["message"], refused
     assert fake.calls[0]["op"] == "inspect" and fake.calls[0]["path"] == str(folder)
@@ -329,13 +324,13 @@ async def test_a_real_workers_denied_folder_names_the_account(
         raise PermissionError("no")
 
     monkeypatch.setattr(folder_io, "inspect", denied)
-    refused = await site.manage(ADA, "folder.add", name="Notes", path=str(folder))
+    refused = await site.add_workspace(ADA, name="Notes", path=str(folder))
     assert refused["status"] == "failed" and "(HOST/ada)" in refused["message"], refused
 
 
 async def test_folder_add_needs_the_owners_worker(open_site: OpenSite, folder: Path) -> None:
     site = await open_site(worker=False)
-    refused = await site.manage(ADA, "folder.add", name="Notes", path=str(folder))
+    refused = await site.add_workspace(ADA, name="Notes", path=str(folder))
     assert refused["status"] == "failed" and "not" in refused["message"], refused
     assert "You are not signed in" in refused["message"] or "is not running" in refused["message"]
 
@@ -345,12 +340,10 @@ async def test_a_worker_that_dies_mid_call_leaves_a_write_uncertain_and_a_read_f
 ) -> None:
     site = await open_site()
     folder_id = await shared(site, folder, BO)
-    await site.manage(ADA, "folder.remove", id=folder_id)
-    added = await site.manage(ADA, "folder.add", name="Notes", path=str(folder), writable=True)
+    await site.manage(ADA, "workspace.remove", id=folder_id)
+    added = await site.add_workspace(ADA, name="Notes", path=str(folder), writable=True)
     folder_id = str(added["result"]["id"])
-    await site.manage(
-        ADA, "folder.people", id=folder_id, people=[{"subject": BO, "writable": True}]
-    )
+    await site.share_workspace(ADA, id=folder_id, people=[(BO, True)])
     await drop_worker(site)
     fake = FakeWorker(site, lambda _m: None)
     await fake.start()
@@ -411,7 +404,9 @@ async def test_the_summary_carries_links_link_page_and_sharing(
         link_entry(ADA, ME, "ada"),
         link_entry(BO, OTHER_ACCOUNT, "bo"),
     )
-    site = await open_site(link_page="http://127.0.0.1:8079/link")
+    site = await open_site(
+        link_page="http://127.0.0.1:8079/link", approve_page="http://127.0.0.1:8079/link/approve"
+    )
     await shared(site, folder, BO)
     summary = site.host.summary()
     assert summary is not None

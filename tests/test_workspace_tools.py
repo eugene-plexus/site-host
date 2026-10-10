@@ -277,11 +277,9 @@ async def test_an_edit_too_large_or_in_a_read_only_folder_is_refused(
     )
     assert "at most 1 MiB" in grown
     (tmp_path / "reading").mkdir()
-    found = await site.manage(ADA, "folder.add", name="Reading", path=str(tmp_path / "reading"))
+    found = await site.add_workspace(ADA, name="Reading", path=str(tmp_path / "reading"))
     assert found["status"] == "done", found
-    await site.manage(
-        ADA, "folder.people", id=found["result"]["id"], people=[{"subject": BO, "writable": False}]
-    )
+    await site.share_workspace(ADA, id=found["result"]["id"], people=[(BO, False)])
     answer = await site.mcp(
         BO,
         FILES,
@@ -375,10 +373,8 @@ async def test_a_search_that_runs_out_of_time_failed_it_did_not_act(
     open_site: OpenSite, folder: Path
 ) -> None:
     site = await open_site()
-    added = await site.manage(ADA, "folder.add", name="Notes", path=str(folder))
-    await site.manage(
-        ADA, "folder.people", id=added["result"]["id"], people=[{"subject": BO, "writable": False}]
-    )
+    added = await site.add_workspace(ADA, name="Notes", path=str(folder))
+    await site.share_workspace(ADA, id=added["result"]["id"], people=[(BO, False)])
     await drop_worker(site)
     fake = FakeWorker(site, lambda _m: None)
     await fake.start()

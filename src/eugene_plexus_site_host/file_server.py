@@ -5,7 +5,7 @@ The tools the helper used to take as a bespoke `{tool, arguments}` command
 (`remote-nodes.md` §2.1) are MCP tools, served by the SDK like any other
 server's (J6). 2b.3a added a read of any part of a file, `edit_text`, `glob`
 and `grep` (`workspace_tools.py`). `inspect` is not a tool: registering a
-folder is a management action (`folder.add`).
+workspace is a management action (`workspace.add`).
 
 Each tool takes a `folder` argument, a workspace's name in the person's view
 (their own workspaces, then those the owner shared with them, 2b.3b). The
