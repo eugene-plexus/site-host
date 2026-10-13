@@ -26,7 +26,7 @@ import httpx
 from pydantic import ValidationError
 
 from ._generated.models import SiteCall, SiteManage
-from .host import PROTOCOL, Host, version
+from .host import PROTOCOL, Host, clipped, version
 from .identity import Enrollment, Identity, IdentityError
 from .join import _problem
 from .root_link import RootLink, RootTlsError
@@ -79,7 +79,7 @@ class Channel:
             "protocol": PROTOCOL,
             "hostVersion": version()[:64],
             "ready": reason is None,
-            "reason": reason,
+            "reason": clipped(reason),
             "account": self.settings.account_kind,
             "site": self.host.summary(),
         }

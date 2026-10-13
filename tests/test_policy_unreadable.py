@@ -19,6 +19,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import secrets
 import time
 from pathlib import Path
@@ -27,17 +28,25 @@ from typing import Any
 import pytest
 from fastapi.testclient import TestClient
 
-from eugene_plexus_site_host._generated.models import SiteManage
+from eugene_plexus_site_host._generated.models import (
+    SiteManage,
+    SiteReport,
+    SiteServer,
+    SiteSummary,
+)
 from eugene_plexus_site_host.app import create_app
-from eugene_plexus_site_host.host import FILES, Host
+from eugene_plexus_site_host.channel import Channel
+from eugene_plexus_site_host.host import FILES, REASON_LIMIT, Host, clipped
+from eugene_plexus_site_host.identity import Identity
 from eugene_plexus_site_host.policy import (
+    PROBLEM_LIMIT,
     UNREADABLE_SUFFIX,
     VERSION,
     Policy,
     PolicyUnreadable,
 )
 
-from .conftest import ADA, OpenSite, settings_for
+from .conftest import ADA, OpenSite, local_server, settings_for
 from .test_app import Idle
 
 #: What site-host 4f6c075 wrote with `Policy.save`: a folder with three people
@@ -144,7 +153,7 @@ BROKEN: dict[str, tuple[bytes, str]] = {
     ),
     "a rule that is not a decision": (
         a_policy(workspaces=[a_workspace(rules={"read_text": "maybe"})]),
-        "workspace 1 has a rule that is not allow, ask or deny (read_text: 'maybe')",
+        "workspace 1 has a rule that is not allow, ask or deny ('read_text': 'maybe')",
     ),
     "a person with no rules": (
         a_policy(workspaces=[a_workspace(people=[{"subject": "person-bo"}])]),
@@ -189,7 +198,8 @@ def test_a_file_that_cannot_be_used_is_refused_naming_the_file_and_the_fault(
     with pytest.raises(PolicyUnreadable) as caught:
         Policy.load(path, ADA)
 
-    assert str(path) in str(caught.value), "it must say which file"
+    assert str(caught.value).startswith("policy.json "), "it must say which file, by its name"
+    assert str(tmp_path) not in str(caught.value), "and not where it is"
     assert words in str(caught.value), str(caught.value)
 
 
@@ -202,7 +212,8 @@ def test_a_file_that_is_a_directory_is_refused_naming_what_the_system_said(
     with pytest.raises(PolicyUnreadable) as caught:
         Policy.load(path)
 
-    assert str(path) in str(caught.value) and "could not be read (" in str(caught.value)
+    assert str(caught.value).startswith("policy.json could not be read (")
+    assert str(tmp_path) not in str(caught.value)
 
 
 def test_a_policy_this_host_saved_loads(tmp_path: Path) -> None:
@@ -259,11 +270,12 @@ def test_a_host_over_a_policy_that_cannot_be_used_starts_and_says_why(
     reason = host.reason()
     assert reason is not None
     assert reason.startswith("This site's policy could not be used: ")
-    assert str(path) in reason and words in reason, reason
+    assert "policy.json" in reason and words in reason, reason
+    assert str(path) not in reason, "the reason goes to the root; the path is the log's"
     assert "Nothing runs here until the file is restored, or removed" in reason
-    # Said in the log once, in the same words.
+    # Said in the log once, in the same words, and with where the file is.
     logged = [r.getMessage() for r in caplog.records if r.levelno == logging.ERROR]
-    assert logged == [reason]
+    assert logged == [f"{reason} The file is {path}."]
     # The file is where it was, as it was, and a copy is beside it.
     assert path.read_bytes() == content
     assert (tmp_path / "data" / ("policy.json" + UNREADABLE_SUFFIX)).read_bytes() == content
@@ -282,8 +294,8 @@ def test_a_host_over_a_directory_in_the_policys_place_starts_and_says_why(
         host = Host(settings)
 
     reason = host.reason()
-    assert reason is not None and str(policy_path(tmp_path)) in reason
-    assert "could not be read (" in reason
+    assert reason is not None and "policy.json could not be read (" in reason
+    assert str(policy_path(tmp_path)) not in reason
     # There is nothing to copy, and that is said, not raised.
     assert "A copy is kept" not in reason
     assert any("could not keep a copy" in r.getMessage() for r in caplog.records)
@@ -366,8 +378,8 @@ def test_the_health_report_and_the_poll_both_name_the_file(tmp_path: Path) -> No
 
     body = answer.json()
     assert answer.status_code == 503 and body["ready"] is False
-    assert str(policy_path(tmp_path)) in body["reason"]
-    assert "is policy version 1, and this host reads version 2" in body["reason"]
+    assert "policy.json is policy version 1, and this host reads version 2" in body["reason"]
+    assert str(tmp_path) not in body["reason"], "the open health report carries no path"
     # What the site reports to its root says the same, and offers nothing.
     assert report is not None and report["workspaces"] == [] and report["access"] == []
 
@@ -424,7 +436,9 @@ def test_a_file_edited_and_still_no_good_is_reported_as_it_is_now(
         second = host.reason()
 
     assert second is not None and "is policy version 1" in second
-    assert [r.getMessage() for r in caplog.records] == [second]
+    assert [r.getMessage() for r in caplog.records] == [
+        f"{second} The file is {policy_path(tmp_path)}."
+    ]
     assert (tmp_path / "data" / ("policy.json" + UNREADABLE_SUFFIX)).read_bytes() == (
         V1_POLICY.encode("utf-8")
     )
@@ -458,3 +472,254 @@ async def test_an_approval_is_refused_before_its_signature_is_spent(
     assert second.host.sequence.last(ADA) == before, "the signature was spent"
     assert second.host.held.get(item.id) is not None, "the held change was dropped"
     assert policy_path(tmp_path).read_bytes() == V1_POLICY.encode("utf-8")
+
+
+# --------------------------------------------------------------------------- #
+# What the reason says: the file by its name, and only so much
+#
+# The reason is on the open /healthz, which "never carries a path, a name or a
+# person", and in every report the site sends its root, which refuses a poll
+# whose reason is over 1024 characters. On a per-user install the path holds
+# the OS account's name.
+# --------------------------------------------------------------------------- #
+
+BACKSLASH = chr(92)
+
+#: `maxLength` of every reason in the contract (`openapi/components/sites.yaml`,
+#: five places): written out, so the code's own constant is not what it is
+#: measured against.
+CAP = 1024
+
+
+def no_directory(text: str, tmp_path: Path) -> None:
+    """`text` names `policy.json` and nothing of where it is: not the data
+    directory, not a drive letter, not a separator in front of the name,
+    whichever way this platform writes one."""
+    assert "policy.json" in text, text
+    for where in (tmp_path, policy_path(tmp_path).parent, policy_path(tmp_path)):
+        assert str(where) not in text, text
+    for separator in ("/", BACKSLASH):
+        assert separator + "policy.json" not in text, text
+    assert not re.search("[A-Za-z]:[/" + BACKSLASH * 2 + "]", text), text
+
+
+def reported(tmp_path: Path, content: bytes) -> tuple[Host, dict[str, Any]]:
+    """A host over `content` as its policy file, with one local server, and
+    what its channel would send the root in the next poll."""
+    settings = settings_for(tmp_path, local_servers=(local_server(),))
+    policy_path(tmp_path).write_bytes(content)
+    host = Host(settings)
+    return host, Channel(host, Identity(settings.data_dir), settings).report()
+
+
+@pytest.mark.parametrize("case", list(BROKEN))
+def test_the_reason_names_the_file_and_not_the_directory_it_is_in(
+    tmp_path: Path, case: str
+) -> None:
+    reason = host_over(tmp_path, BROKEN[case][0]).reason()
+
+    assert reason is not None
+    no_directory(reason, tmp_path)
+
+
+def test_the_reason_for_a_directory_in_the_policys_place_names_no_path(tmp_path: Path) -> None:
+    settings = settings_for(tmp_path)
+    policy_path(tmp_path).mkdir()
+
+    reason = Host(settings).reason()
+
+    assert reason is not None
+    no_directory(reason, tmp_path)
+
+
+@pytest.mark.parametrize("case", ["not JSON", "version 1", "a rule that is not a decision"])
+def test_the_open_health_report_names_no_path(tmp_path: Path, case: str) -> None:
+    settings = settings_for(tmp_path)
+    policy_path(tmp_path).write_bytes(BROKEN[case][0])
+    with TestClient(create_app(settings, channel=Idle())) as client:  # type: ignore[arg-type]
+        answer = client.get("/healthz")
+
+    assert answer.status_code == 503
+    no_directory(answer.json()["reason"], tmp_path)
+
+
+@pytest.mark.parametrize("case", ["not JSON", "version 1", "a rule that is not a decision"])
+def test_what_the_site_reports_to_its_root_names_no_path(tmp_path: Path, case: str) -> None:
+    host, report = reported(tmp_path, BROKEN[case][0])
+
+    SiteReport.model_validate(report)  # what the root checks the poll against
+    [server] = report["site"]["servers"]
+    for reason in (report["reason"], server["reason"]):
+        no_directory(reason, tmp_path)
+    view = host._server_view("fixture")
+    SiteServer.model_validate(view)
+    no_directory(view["reason"], tmp_path)
+
+
+def test_the_log_still_says_where_the_file_is(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    with caplog.at_level(logging.ERROR):
+        host_over(tmp_path, b"{ broken")
+
+    [line] = [r.getMessage() for r in caplog.records if r.levelno == logging.ERROR]
+    assert line.endswith(f"The file is {policy_path(tmp_path)}.")
+
+
+JUNK = "x" * 3000
+
+#: What the file supplied that the problem quotes, each 3000 characters long.
+TOO_LONG: dict[str, bytes] = {
+    "a rule's decision": a_policy(workspaces=[a_workspace(rules={"read_text": JUNK})]),
+    "a rule's tool": a_policy(workspaces=[a_workspace(rules={JUNK: "maybe"})]),
+    "a person's rule": a_policy(
+        workspaces=[a_workspace(people=[{"subject": "person-bo", "rules": {"read_text": JUNK}}])]
+    ),
+    "a version": a_policy(version=JUNK),
+    "a decision that is a list": a_policy(workspaces=[a_workspace(rules={"read_text": [JUNK]})]),
+    "a decision that is an object": a_policy(
+        workspaces=[a_workspace(rules={"read_text": {JUNK: JUNK}})]
+    ),
+    "a tool's decision on a server": a_policy(
+        access=[
+            {
+                "subject": "person-bo",
+                "server": "git",
+                "tools": [{"name": "log", "decision": [JUNK]}],
+            }
+        ]
+    ),
+}
+
+
+@pytest.mark.parametrize("case", list(TOO_LONG))
+def test_a_long_value_in_the_file_cannot_make_the_reason_long_or_the_report_invalid(
+    tmp_path: Path, case: str
+) -> None:
+    host, report = reported(tmp_path, TOO_LONG[case])
+
+    reason = host.reason()
+    assert reason is not None and len(reason) <= 600, len(reason or "")
+    assert "x" * 100 not in reason, "the file's own words were not cut"
+    no_directory(reason, tmp_path)
+    # What the owner does next is whole, whatever the file held.
+    assert "Nothing runs here until the file is restored, or removed" in reason
+    assert reason.endswith("A copy is kept as policy.json.unreadable.")
+    # And the poll carrying it is one the contract accepts: before, the root
+    # refused it, and the site could not say why it was down.
+    SiteReport.model_validate(report)
+    assert report["reason"] == reason
+
+
+def test_a_rule_that_is_a_long_decision_is_quoted_cut_and_marked(tmp_path: Path) -> None:
+    reason = host_over(tmp_path, TOO_LONG["a rule's decision"]).reason()
+
+    assert reason is not None
+    assert "('read_text': '" + "x" * 30 in reason
+    assert "x…)" in reason, "the cut is marked"
+
+
+@pytest.mark.parametrize("decision", [["allow"], {"allow": True}, 5, None, True])
+def test_a_decision_that_is_not_a_word_is_named_and_not_raised(
+    tmp_path: Path, decision: Any
+) -> None:
+    """A list or an object is unhashable, and `decision in {"allow", ...}`
+    raised `TypeError` out of the loader: the site did not start, instead of
+    running on nothing and saying why."""
+    policy_path(tmp_path).parent.mkdir(parents=True, exist_ok=True)
+    policy_path(tmp_path).write_bytes(
+        a_policy(workspaces=[a_workspace(rules={"read_text": decision})])
+    )
+
+    with pytest.raises(PolicyUnreadable, match="has a rule that is not allow, ask or deny"):
+        Policy.load(policy_path(tmp_path), ADA)
+    assert "policy.json" in str(host_over(tmp_path, None).reason())
+
+
+@pytest.mark.parametrize("decision", [["allow"], {"allow": True}, 5, True])
+def test_a_tool_decision_on_a_server_that_is_not_a_word_is_named_and_not_raised(
+    tmp_path: Path, decision: Any
+) -> None:
+    policy_path(tmp_path).parent.mkdir(parents=True, exist_ok=True)
+    policy_path(tmp_path).write_bytes(
+        a_policy(
+            access=[
+                {
+                    "subject": "person-bo",
+                    "server": "git",
+                    "tools": [{"name": "log", "decision": decision}],
+                }
+            ]
+        )
+    )
+
+    with pytest.raises(PolicyUnreadable, match="has a tool whose decision is not allow"):
+        Policy.load(policy_path(tmp_path), ADA)
+
+
+def test_the_whole_problem_is_cut_at_the_limit_and_keeps_what_the_owner_does_next(
+    tmp_path: Path,
+) -> None:
+    """Whatever a source puts in `PolicyUnreadable`: the fault is what is cut,
+    never the part that says what to do or where the copy is."""
+    policy = Policy.unreadable(
+        tmp_path / "policy.json",
+        ADA,
+        PolicyUnreadable("y" * 5000),
+        tmp_path / ("policy.json" + UNREADABLE_SUFFIX),
+    )
+
+    assert PROBLEM_LIMIT == 600
+    assert policy.problem is not None and len(policy.problem) == 600
+    assert policy.problem.startswith("This site's policy could not be used: yyy")
+    assert "y…. Nothing runs here until the file is restored, or removed" in policy.problem
+    assert policy.problem.endswith("A copy is kept as policy.json.unreadable.")
+
+
+def test_a_short_problem_is_left_exactly_as_it_was() -> None:
+    policy = Policy.unreadable(
+        Path("policy.json"), ADA, PolicyUnreadable("policy.json is not valid JSON (x)")
+    )
+
+    assert policy.problem == (
+        "This site's policy could not be used: policy.json is not valid JSON (x). "
+        "Nothing runs here until the file is restored, or removed to start with no workspaces."
+    )
+
+
+async def test_a_reason_over_the_contracts_cap_is_cut_wherever_the_report_carries_one(
+    tmp_path: Path, open_site: OpenSite, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The backstop. Each source bounds its own reason (the policy's problem is
+    cut at 600), and this is what a source that does not cannot take the
+    report down with: the root refuses a poll carrying a reason over 1024
+    characters, in any of the five places the contract caps one."""
+    site = await open_site(tmp_path, worker=False, local_servers=(local_server(),))
+    host = site.host
+    host.policy.add_workspace(a_workspace())  # so the file server is in the report too
+    # Four sources of a reason that are not the policy's, each far over the cap.
+    host.workers.problem = "w" * 5000
+    monkeypatch.setattr(Host, "_not_running", lambda self, link, own: "n" * 5000)
+    monkeypatch.setattr(Host, "_commands_reason", lambda self, state: "c" * 5000)
+
+    report = Channel(host, host.identity, host.settings).report()
+
+    SiteReport.model_validate(report)
+    summary = report["site"]
+    SiteSummary.model_validate(summary)
+    assert len(report["reason"]) == CAP
+    assert {s["id"]: len(s["reason"]) for s in summary["servers"]} == {FILES: CAP, "fixture": CAP}
+    assert [len(link["reason"]) for link in summary["links"]] == [CAP]
+    assert len(summary["commands"]["reason"]) == CAP
+    for server in (FILES, "fixture"):
+        view = host._server_view(server)
+        SiteServer.model_validate(view)
+        assert len(view["reason"]) == CAP
+
+
+def test_a_reason_within_the_cap_is_never_touched() -> None:
+    assert REASON_LIMIT == CAP
+    assert clipped(None) is None
+    assert clipped("") == ""
+    assert clipped("w" * CAP) == "w" * CAP
+    assert clipped("w" * (CAP + 1)) == "w" * (CAP - 1) + "…"

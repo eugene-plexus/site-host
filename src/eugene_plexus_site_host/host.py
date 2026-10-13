@@ -134,6 +134,23 @@ SIGNED_META = "eugene-plexus/signed"
 #: How long a worker has to answer one call. A local server's own limit is
 #: 20 s (`local_servers.CALL_SECONDS`), and a claimed operation lives 30 s.
 WORKER_SECONDS = 25.0
+#: The longest reason a report may carry: `maxLength` of `SiteReport.reason`,
+#: `SiteServer.reason`, `SiteCommands.reason` and `SitePersonLink.reason`. The
+#: root refuses a poll with a longer one, and a site that cannot be heard
+#: cannot say why it is down.
+REASON_LIMIT = 1024
+
+
+def clipped(reason: str | None) -> str | None:
+    """`reason`, at most `REASON_LIMIT` characters, with a mark where it was cut.
+
+    The backstop. Each source of a reason bounds its own (the policy's problem
+    is cut at 600), so this changes nothing a source got right; it is what a
+    source that got it wrong, or one added later, cannot take the site's
+    report down with."""
+    if reason is None or len(reason) <= REASON_LIMIT:
+        return reason
+    return reason[: REASON_LIMIT - 1] + "…"
 
 
 class Refused(Exception):
@@ -1476,7 +1493,7 @@ class Host:
             "allowed": state.allowed,
             "consentedAt": state.consented_at,
             "withdrawnAt": state.withdrawn_at,
-            "reason": None if state.allowed else self._commands_reason(state),
+            "reason": None if state.allowed else clipped(self._commands_reason(state)),
         }
 
     async def _audit_read(self, subject: str, arguments: dict[str, Any]) -> dict[str, Any]:
@@ -2348,7 +2365,9 @@ class Host:
             "system": False,
             "enabled": any_workspace,
             "available": any_workspace and reason is None,
-            "reason": reason if any_workspace else "No workspace is registered on this machine.",
+            "reason": clipped(
+                reason if any_workspace else "No workspace is registered on this machine."
+            ),
             "tools": [
                 tool_view(t)
                 for t in file_server.tools(
@@ -2378,7 +2397,7 @@ class Host:
             "system": bool(local.system),
             "enabled": enabled,
             "available": enabled and problem is None,
-            "reason": problem,
+            "reason": clipped(problem),
             "tools": [tool_view(t) for t in self.local.known_tools(local)] if enabled else [],
         }
 
@@ -2393,7 +2412,7 @@ class Host:
                     "subject": link.subject,
                     "accountName": link.account_name,
                     "available": available,
-                    "reason": None if available else self._not_running(link, own=True),
+                    "reason": None if available else clipped(self._not_running(link, own=True)),
                     "keys": len(link.keys) + len(self.passkeys_of(link.subject)),
                     "signing": self.signing_state(link.subject),
                     "held": len(self.held.for_subject(link.subject)),

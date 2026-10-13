@@ -26,6 +26,16 @@ runs on `Policy.unreadable`: nothing is allowed, nothing may be saved over the
 file, and the report says why. A copy of the file is kept beside it, and a
 file put right is read again at the next check.
 
+**What it says reaches the root, so it carries no path and is bounded.** The
+problem is the reason on the open `/healthz` and in every report the site
+sends, and on a per-user install the path holds the OS account's name: the
+file is named by its name (`policy.json`), and the full path goes to the log
+alone. A value that came out of the file (a tool's name, a decision, a
+version) is quoted cut at `SHOWN` characters, and the whole problem is cut at
+`PROBLEM_LIMIT`, because the contract caps every reason at 1024 and a root
+refuses a poll that carries a longer one, which would leave the site unable
+to say why it is down.
+
 **Approved, per person** (J14a, J52, J67, J79): `authorized` holds, for each
 person, the digest of their own rules as they last approved them with their
 own key. The owner's covers their workspaces, whom they shared them with,
@@ -55,6 +65,12 @@ VERSION = 2
 #: Where a policy file that could not be used is kept, beside itself. One
 #: fixed name: the next start has the same file to keep.
 UNREADABLE_SUFFIX = ".unreadable"
+#: How many characters of a value the file supplied a message about the file
+#: quotes. What a stranger wrote is not ours to repeat whole.
+SHOWN = 40
+#: The most the whole problem about an unusable file may say (see the module
+#: docstring): well inside the 1024 characters the contract allows a reason.
+PROBLEM_LIMIT = 600
 # Without it a Windows descriptor is in the C runtime's text mode.
 _O_BINARY = getattr(os, "O_BINARY", 0)
 MAX_WORKSPACES = 512
@@ -135,16 +151,37 @@ class PolicyUnreadable(ValueError):
 _DECISIONS = frozenset({"allow", "ask", "deny"})
 
 
+def _clipped(text: str, limit: int) -> str:
+    """`text`, at most `limit` characters, with a mark where it was cut."""
+    return text if len(text) <= limit else text[: limit - 1] + "…"
+
+
+def _shown(value: Any) -> str:
+    """A value that came out of the file, quoted (so what it holds that is not
+    plain text is escaped) and cut at `SHOWN` characters."""
+    return _clipped(repr(value), SHOWN)
+
+
 def _text(value: Any) -> bool:
     return isinstance(value, str) and bool(value)
+
+
+def _decision(value: Any) -> bool:
+    """Whether `value` is allow, ask or deny. Not `value in _DECISIONS` alone: a
+    list or an object in a hand-edited file is unhashable, and that raised
+    `TypeError` out of the loader instead of naming the fault."""
+    return isinstance(value, str) and value in _DECISIONS
 
 
 def _rules_problem(rules: Any, where: str) -> str | None:
     if not isinstance(rules, dict):
         return f"{where} has no rules"
     for tool, decision in rules.items():
-        if decision not in _DECISIONS:
-            return f"{where} has a rule that is not allow, ask or deny ({tool}: {decision!r})"
+        if not _decision(decision):
+            return (
+                f"{where} has a rule that is not allow, ask or deny "
+                f"({_shown(tool)}: {_shown(decision)})"
+            )
     return None
 
 
@@ -184,7 +221,7 @@ def _access_problem(entry: Any, where: str) -> str | None:
     for tool in tools:
         if not isinstance(tool, dict) or not _text(tool.get("name")):
             return f"{where} has a tool with no name"
-        if tool.get("decision") is not None and tool["decision"] not in _DECISIONS:
+        if tool.get("decision") is not None and not _decision(tool["decision"]):
             return f"{where} has a tool whose decision is not allow, ask or deny"
     return None
 
@@ -257,37 +294,42 @@ class Policy:
     def load(cls, path: Path, owner: str | None = None) -> Policy:
         """The policy at `path`, empty when there is no file yet.
 
-        Raises `PolicyUnreadable`, naming the file and what is wrong, for a
-        file that cannot be read, is not version 2, or holds an entry this
-        host could not use."""
+        Raises `PolicyUnreadable`, naming the file (by its name, not its path:
+        see the module docstring) and what is wrong, for a file that cannot be
+        read, is not version 2, or holds an entry this host could not use."""
         policy = cls(path, owner)
         if not path.exists():
             return policy
+        name = path.name
         try:
             text = path.read_text(encoding="utf-8")
         except UnicodeDecodeError as exc:
             raise PolicyUnreadable(
-                f"{path} is not UTF-8 text ({exc.reason} at byte {exc.start})"
+                f"{name} is not UTF-8 text ({exc.reason} at byte {exc.start})"
             ) from exc
         except OSError as exc:
-            raise PolicyUnreadable(f"{path} could not be read ({exc.strerror or exc})") from exc
+            # `exc.strerror` is the system's words and holds no path; `str(exc)`
+            # of an `OSError` without one is `[Errno n] ...: 'the path'`.
+            raise PolicyUnreadable(
+                f"{name} could not be read ({exc.strerror or type(exc).__name__})"
+            ) from exc
         try:
             value = json.loads(text)
         except json.JSONDecodeError as exc:
             raise PolicyUnreadable(
-                f"{path} is not valid JSON ({exc.msg}, line {exc.lineno}, column {exc.colno})"
+                f"{name} is not valid JSON ({exc.msg}, line {exc.lineno}, column {exc.colno})"
             ) from exc
         if not isinstance(value, dict):
             raise PolicyUnreadable(
-                f"{path} holds {type(value).__name__}, not a policy: a policy is an object"
+                f"{name} holds {type(value).__name__}, not a policy: a policy is an object"
             )
         if value.get("version") != VERSION:
             raise PolicyUnreadable(
-                f"{path} is policy version {value.get('version')!r}, "
+                f"{name} is policy version {_shown(value.get('version'))}, "
                 f"and this host reads version {VERSION}"
             )
         if problem := problem_in(value):
-            raise PolicyUnreadable(f"{path} cannot be used: {problem}")
+            raise PolicyUnreadable(f"{name} cannot be used: {problem}")
         policy.workspaces = [
             {
                 **w,
@@ -315,11 +357,15 @@ class Policy:
         allowed, and `save` refuses to write over the file."""
         policy = cls(path, owner)
         policy.cause = str(error)
-        policy.problem = (
-            f"This site's policy could not be used: {error}. Nothing runs here until the "
-            "file is restored, or removed to start with no workspaces."
-            + (f" A copy is kept as {kept.name}." if kept is not None else "")
+        opening = "This site's policy could not be used: "
+        closing = (
+            ". Nothing runs here until the file is restored, or removed to start with no "
+            "workspaces." + (f" A copy is kept as {kept.name}." if kept is not None else "")
         )
+        # What is cut, if anything, is the fault, whose words vary: the rest
+        # is what the owner does next, and is always whole.
+        room = PROBLEM_LIMIT - len(opening) - len(closing)
+        policy.problem = opening + _clipped(str(error), room) + closing
         return policy
 
     @classmethod
@@ -331,7 +377,9 @@ class Policy:
             return cls.load(path, owner)
         except PolicyUnreadable as exc:
             policy = cls.unreadable(path, owner, exc, keep_a_copy(path))
-            log.error("%s", policy.problem)
+            # The one place the whole path is said: the log is the machine's
+            # own, and the owner reading it has to know which file.
+            log.error("%s The file is %s.", policy.problem, path)
             return policy
 
     def save(self) -> None:
