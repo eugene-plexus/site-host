@@ -501,57 +501,6 @@ async def test_an_unlinked_holders_workspace_is_never_opened_by_the_owners_worke
     assert "Mine" not in json.dumps(await site.mcp(BO, FILES, "tools/list"))
 
 
-# --- version 1 becomes the owner's workspaces (J69) ---------------------------------------
-
-
-def test_a_version_1_policy_is_the_owners_workspaces_with_what_each_had(tmp_path: Path) -> None:
-    path = tmp_path / "policy.json"
-    folder = {"id": "a" * 32, "name": "Notes", "path": "/srv/notes", "identity": "1:2:3"}
-    path.write_text(
-        json.dumps(
-            {
-                "version": 1,
-                "folders": [
-                    {
-                        **folder,
-                        "writable": True,
-                        "people": [
-                            {"subject": ADA, "writable": True},
-                            {"subject": BO, "writable": True},
-                            {"subject": CY, "writable": False},
-                        ],
-                    }
-                ],
-                "access": [
-                    {
-                        "subject": BO,
-                        "server": "git",
-                        "tools": [{"name": "push", "standing": True}, {"name": "log"}],
-                    },
-                    {"subject": BO, "server": "files.old", "tools": [{"name": "read_text"}]},
-                ],
-                "enabled": {"git": True},
-                "ownerInDevMode": False,
-                "authorized": "f" * 64,
-            }
-        ),
-        encoding="utf-8",
-    )
-    policy = Policy.load(path, ADA)
-    [notes] = policy.workspaces
-    assert notes["holder"] == ADA and notes["deny"] == []
-    assert notes["rules"]["read_text"] == "allow" and notes["rules"]["write_text"] == "ask"
-    people = {p["subject"]: p["rules"] for p in notes["people"]}
-    assert set(people) == {BO, CY}  # the owner has rules of their own now
-    assert people[BO]["edit_text"] == "allow" and people[CY]["write_text"] == "deny"
-    assert policy.tools_for(BO, "git") == {"push": "allow", "log": None}
-    assert policy.access == [policy.access[0]]  # the per-folder servers grant nothing
-    # The digest's shape changed: the owner approves their rules once more.
-    assert policy.authorized == {} and not policy.approved(ADA)
-    policy.save()
-    assert json.loads(path.read_text(encoding="utf-8"))["version"] == 2
-
-
 # --- local servers under allow and ask (J78) ---------------------------------------------
 
 

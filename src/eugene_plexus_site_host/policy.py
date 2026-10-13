@@ -19,6 +19,13 @@ change, whatever the rules say.
 A local server is off until the site's owner turns it on, and a person has
 none of its tools until the owner names them, each `allow` or `ask` (J78).
 
+**A file that cannot be used is not run on in part.** One that cannot be read,
+is not version 2 or holds an entry this host could not use makes `Policy.load`
+raise `PolicyUnreadable`, naming the file and what is wrong. The host then
+runs on `Policy.unreadable`: nothing is allowed, nothing may be saved over the
+file, and the report says why. A copy of the file is kept beside it, and a
+file put right is read again at the next check.
+
 **Approved, per person** (J14a, J52, J67, J79): `authorized` holds, for each
 person, the digest of their own rules as they last approved them with their
 own key. The owner's covers their workspaces, whom they shared them with,
@@ -30,16 +37,26 @@ a whole. Rules that grant nothing need no approval.
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
+import logging
 import os
+import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from .file_server import COMMANDS, DESTRUCTIVE, READ_ONLY, SERVER, unique_names
+from .file_server import COMMANDS, DESTRUCTIVE, READ_ONLY, unique_names
+
+log = logging.getLogger(__name__)
 
 VERSION = 2
+#: Where a policy file that could not be used is kept, beside itself. One
+#: fixed name: the next start has the same file to keep.
+UNREADABLE_SUFFIX = ".unreadable"
+# Without it a Windows descriptor is in the C runtime's text mode.
+_O_BINARY = getattr(os, "O_BINARY", 0)
 MAX_WORKSPACES = 512
 MAX_PER_PERSON = 64
 MAX_DENY = 64
@@ -110,64 +127,114 @@ def decision_for(tools: dict[str, str], tool: str, writable: bool) -> str:
     return tools.get(tool, "deny")
 
 
-def _from_v1(value: dict[str, Any], owner: str | None) -> dict[str, Any]:
-    """Version 1's folders as the owner's workspaces (J69), with §2.6's
-    defaults for the owner and, for each person on a folder's list, what
-    they had: changing files was a standing pre-approval, so it reads
-    `allow`. The owner's approval is not carried: its digest's shape
-    changed, and they approve their rules once more."""
-    workspaces = []
-    for folder in value.get("folders") or []:
-        writable = bool(folder.get("writable"))
-        people = [
-            {
-                "subject": str(p["subject"]),
-                "rules": per_tool(
-                    {
-                        "read": "allow",
-                        "change": "allow" if writable and p.get("writable") else "deny",
-                    }
-                ),
-            }
-            for p in folder.get("people") or []
-            if p.get("subject") != owner
-        ]
-        workspaces.append(
-            {
-                "id": folder["id"],
-                "name": folder["name"],
-                "path": folder["path"],
-                "identity": folder["identity"],
-                "holder": owner,
-                "writable": writable,
-                "rules": per_tool(default_groups(writable)),
-                "deny": [],
-                "people": people,
-            }
-        )
-    access = [
-        {
-            "subject": e["subject"],
-            "server": e["server"],
-            # A tool granted without `standing` was one the site did not treat
-            # as destructive: its decision follows the tool (J78).
-            "tools": [
-                {"name": t["name"], "decision": "allow" if t.get("standing") else None}
-                for t in e.get("tools") or []
-            ],
-        }
-        for e in value.get("access") or []
-        # Grants on the first build's per-folder servers (`files.<id>`) grant
-        # nothing now.
-        if not str(e.get("server")).startswith(SERVER)
-    ]
-    return {
-        "workspaces": workspaces,
-        "access": access,
-        "enabled": value.get("enabled") or {},
-        "ownerInDevMode": bool(value.get("ownerInDevMode")),
-        "authorized": {},
-    }
+class PolicyUnreadable(ValueError):
+    """The policy file cannot be used. The message names the file and what is
+    wrong with it."""
+
+
+_DECISIONS = frozenset({"allow", "ask", "deny"})
+
+
+def _text(value: Any) -> bool:
+    return isinstance(value, str) and bool(value)
+
+
+def _rules_problem(rules: Any, where: str) -> str | None:
+    if not isinstance(rules, dict):
+        return f"{where} has no rules"
+    for tool, decision in rules.items():
+        if decision not in _DECISIONS:
+            return f"{where} has a rule that is not allow, ask or deny ({tool}: {decision!r})"
+    return None
+
+
+def _workspace_problem(workspace: Any, where: str) -> str | None:
+    if not isinstance(workspace, dict):
+        return f"{where} is not an object"
+    for key in ("id", "name", "path", "identity", "holder"):
+        if not _text(workspace.get(key)):
+            return f"{where} has no {key}"
+    if not isinstance(workspace.get("writable"), bool):
+        return f"{where} does not say whether it is writable"
+    if problem := _rules_problem(workspace.get("rules"), where):
+        return problem
+    deny = workspace.get("deny") or []
+    if not isinstance(deny, list) or not all(isinstance(p, str) for p in deny):
+        return f"{where} has a deny list that is not a list of patterns"
+    people = workspace.get("people") or []
+    if not isinstance(people, list):
+        return f"{where} has a list of people that is not a list"
+    for number, person in enumerate(people, start=1):
+        if not isinstance(person, dict) or not _text(person.get("subject")):
+            return f"{where}, person {number} has no subject"
+        if problem := _rules_problem(person.get("rules"), f"{where}, person {number}"):
+            return problem
+    return None
+
+
+def _access_problem(entry: Any, where: str) -> str | None:
+    if not isinstance(entry, dict):
+        return f"{where} is not an object"
+    for key in ("subject", "server"):
+        if not _text(entry.get(key)):
+            return f"{where} has no {key}"
+    tools = entry.get("tools")
+    if not isinstance(tools, list):
+        return f"{where} has no list of tools"
+    for tool in tools:
+        if not isinstance(tool, dict) or not _text(tool.get("name")):
+            return f"{where} has a tool with no name"
+        if tool.get("decision") is not None and tool["decision"] not in _DECISIONS:
+            return f"{where} has a tool whose decision is not allow, ask or deny"
+    return None
+
+
+def problem_in(value: dict[str, Any]) -> str | None:
+    """The first thing wrong with the entries of a version 2 policy, or None.
+
+    Only what this host indexes without asking: a hand-edited file that parses
+    is as much "not run on in part" as one that does not."""
+    workspaces = value.get("workspaces") or []
+    if not isinstance(workspaces, list):
+        return "workspaces is not a list"
+    for number, workspace in enumerate(workspaces, start=1):
+        if problem := _workspace_problem(workspace, f"workspace {number}"):
+            return problem
+    access = value.get("access") or []
+    if not isinstance(access, list):
+        return "access is not a list"
+    for number, entry in enumerate(access, start=1):
+        if problem := _access_problem(entry, f"access entry {number}"):
+            return problem
+    if not isinstance(value.get("enabled") or {}, dict):
+        return "enabled is not an object"
+    return None
+
+
+def keep_a_copy(path: Path) -> Path | None:
+    """The file that could not be used, kept beside itself, private: it holds
+    people's rules. None when it could not be copied; this runs while a
+    failure is explained, and must not add a second."""
+    target = path.with_name(path.name + UNREADABLE_SUFFIX)
+    temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        data = path.read_bytes()
+        # Private from the first byte, whole or not at all, as every file here.
+        fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | _O_BINARY, 0o600)
+        try:
+            with os.fdopen(fd, "wb") as handle:
+                handle.write(data)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temporary, target)
+        except BaseException:
+            with contextlib.suppress(OSError):
+                os.unlink(temporary)
+            raise
+    except OSError as exc:
+        log.warning("could not keep a copy of %s as %s: %s", path, target.name, exc)
+        return None
+    return target
 
 
 @dataclass
@@ -179,17 +246,48 @@ class Policy:
     enabled: dict[str, bool] = field(default_factory=dict)
     owner_in_dev_mode: bool = False
     authorized: dict[str, str] = field(default_factory=dict)
+    problem: str | None = None
+    """Why this policy is empty when its file is not: set by `unreadable`. The
+    host refuses everything while it is, and nothing is saved over the file."""
+    cause: str | None = None
+    """What was wrong with the file, as `PolicyUnreadable` said it, so a file
+    edited and still no good is told apart from one left as it was."""
 
     @classmethod
     def load(cls, path: Path, owner: str | None = None) -> Policy:
+        """The policy at `path`, empty when there is no file yet.
+
+        Raises `PolicyUnreadable`, naming the file and what is wrong, for a
+        file that cannot be read, is not version 2, or holds an entry this
+        host could not use."""
         policy = cls(path, owner)
         if not path.exists():
             return policy
-        value = json.loads(path.read_text(encoding="utf-8"))
-        if not isinstance(value, dict) or value.get("version") not in (1, VERSION):
-            raise ValueError("the site's policy file is not one this host reads")
-        if value["version"] == 1:
-            value = _from_v1(value, owner)
+        try:
+            text = path.read_text(encoding="utf-8")
+        except UnicodeDecodeError as exc:
+            raise PolicyUnreadable(
+                f"{path} is not UTF-8 text ({exc.reason} at byte {exc.start})"
+            ) from exc
+        except OSError as exc:
+            raise PolicyUnreadable(f"{path} could not be read ({exc.strerror or exc})") from exc
+        try:
+            value = json.loads(text)
+        except json.JSONDecodeError as exc:
+            raise PolicyUnreadable(
+                f"{path} is not valid JSON ({exc.msg}, line {exc.lineno}, column {exc.colno})"
+            ) from exc
+        if not isinstance(value, dict):
+            raise PolicyUnreadable(
+                f"{path} holds {type(value).__name__}, not a policy: a policy is an object"
+            )
+        if value.get("version") != VERSION:
+            raise PolicyUnreadable(
+                f"{path} is policy version {value.get('version')!r}, "
+                f"and this host reads version {VERSION}"
+            )
+        if problem := problem_in(value):
+            raise PolicyUnreadable(f"{path} cannot be used: {problem}")
         policy.workspaces = [
             {
                 **w,
@@ -209,7 +307,38 @@ class Policy:
         )
         return policy
 
+    @classmethod
+    def unreadable(
+        cls, path: Path, owner: str | None, error: PolicyUnreadable, kept: Path | None = None
+    ) -> Policy:
+        """What a site runs on while its policy file cannot be used: nothing is
+        allowed, and `save` refuses to write over the file."""
+        policy = cls(path, owner)
+        policy.cause = str(error)
+        policy.problem = (
+            f"This site's policy could not be used: {error}. Nothing runs here until the "
+            "file is restored, or removed to start with no workspaces."
+            + (f" A copy is kept as {kept.name}." if kept is not None else "")
+        )
+        return policy
+
+    @classmethod
+    def load_or_degrade(cls, path: Path, owner: str | None = None) -> Policy:
+        """`load`, or `unreadable` with the file kept beside itself and the
+        failure logged: it never raises, so a bad file cannot stop a site from
+        starting, only from running anything."""
+        try:
+            return cls.load(path, owner)
+        except PolicyUnreadable as exc:
+            policy = cls.unreadable(path, owner, exc, keep_a_copy(path))
+            log.error("%s", policy.problem)
+            return policy
+
     def save(self) -> None:
+        if self.problem:
+            # The file is not this policy: writing it would replace what could
+            # not be read with what could.
+            raise PolicyUnreadable(self.problem)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         data = json.dumps(
             {

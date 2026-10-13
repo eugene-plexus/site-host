@@ -57,6 +57,7 @@ import asyncio
 import contextlib
 import importlib.metadata
 import json
+import logging
 import secrets
 import time
 from collections.abc import Awaitable, Callable
@@ -107,6 +108,7 @@ from .policy import (
     MAX_DENY,
     SHARED_GROUPS,
     Policy,
+    PolicyUnreadable,
     default_groups,
     group_of,
     looser,
@@ -116,6 +118,8 @@ from .policy import (
 from .settings import Settings
 from .signing import PersonKey
 from .workers import WorkerAbsent, WorkerGone, Workers, WorkerTimeout
+
+log = logging.getLogger(__name__)
 
 PROTOCOL = "mcp-2026-07-28"
 MAX_ANSWER = 70_000
@@ -312,7 +316,12 @@ class Host:
         self.settings = settings
         self.identity = identity or Identity(settings.data_dir)
         self.audit = Audit(settings.data_dir)
-        self.policy = Policy.load(settings.data_dir / "policy.json", self.identity.owner())
+        # A policy file that cannot be used must not stop the site from
+        # starting, only from running anything: `Policy.unreadable` allows
+        # nothing, and `reason()` says why (`_policy_problem`).
+        self.policy = Policy.load_or_degrade(
+            settings.data_dir / "policy.json", self.identity.owner()
+        )
         self.local = LocalServers(settings.local_servers, settings.data_dir, verify=False)
         self.links = Links(settings.links_file)
         self.held = signing.HeldStore(settings.data_dir)
@@ -393,9 +402,30 @@ class Host:
             )
         return f"The owner's worker on {machine} is not running. It starts with the machine."
 
+    def _policy_problem(self) -> str | None:
+        """Why this site's policy cannot be used, or None. A file that could
+        not be used is read again here, so an owner who puts it right at the
+        machine has the site back without a restart, as with the links file."""
+        if self.policy.problem is None:
+            return None
+        path = self.policy.path
+        try:
+            fresh = Policy.load(path, self.identity.owner())
+        except PolicyUnreadable as exc:
+            if str(exc) != self.policy.cause:
+                # Edited, and still no good: say what is wrong now.
+                self.policy = Policy.load_or_degrade(path, self.identity.owner())
+            return self.policy.problem
+        log.warning("the site's policy file %s reads again; this site runs on it from now", path)
+        self.policy = fresh
+        return None
+
     def _broken(self) -> str | None:
-        """Why no call can run here: no channel for workers, or a links file
-        that cannot be read (which holds every person's link and keys)."""
+        """Why no call can run here: no channel for workers, a policy file that
+        cannot be used, or a links file that cannot be read (which holds every
+        person's link and keys)."""
+        if problem := self._policy_problem():
+            return problem
         if self.workers.problem:
             return self.workers.problem
         self.links.all()  # reads the file again if it changed, and so its problem
@@ -1093,6 +1123,10 @@ class Host:
                 )
             if name in PASSKEY_ACTIONS:
                 return await self._passkey_action(name, subject, arguments)
+            if name != "audit.read" and (problem := self._policy_problem()):
+                # Nothing is changed, or listed, from a policy that could not be
+                # read: the audit log does not depend on it.
+                raise Refused(problem)
             handler = self._handlers()[name]
             async with self.lock:
                 changes = name not in READS
@@ -1840,6 +1874,10 @@ class Host:
                     raise Refused("This machine has not joined yet.")
                 if act in OWNER_ACTIONS and subject != owner:
                     raise Refused(_ONLY_OWNER)
+                if problem := self._policy_problem():
+                    # Before the signature is spent: it is not used up by a
+                    # change that cannot be applied.
+                    raise Refused(problem)
                 if ident == RULES:
                     # The rules as they are now, not as they were when listed.
                     args = {"digest": self.policy.digest(subject)}
@@ -2265,10 +2303,15 @@ class Host:
     # --- report -----------------------------------------------------------------
 
     def reason(self) -> str | None:
-        """Why no tool can run here now, or None: the platform, the channel
-        for workers, or the links file."""
+        """Why no tool can run here now, or None: the platform, the policy
+        file, the channel for workers, or the links file."""
         self.links.all()  # a problem is only known once the file has been read
-        return self.settings.unavailable() or self.workers.problem or self.links.problem
+        return (
+            self.settings.unavailable()
+            or self._policy_problem()
+            or self.workers.problem
+            or self.links.problem
+        )
 
     def _shared_view(self, workspace: dict[str, Any]) -> list[dict[str, Any]]:
         views = []
