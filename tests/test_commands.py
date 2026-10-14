@@ -118,12 +118,30 @@ async def test_a_long_command_is_followed_by_its_handle_and_its_output_read_on(
     tmp_path: Path,
 ) -> None:
     commands = cmd.Commands()
-    value = await commands.run(
-        folder="w", cwd=str(tmp_path), command=lines(3) + "; " + sleeping(2), budget=0.5
+    hold = (
+        "while (-not (Test-Path -LiteralPath release.txt)) { Start-Sleep -Milliseconds 20 }"
+        if sys.platform == "win32"
+        else "while [ ! -f release.txt ]; do sleep 0.02; done"
     )
-    assert value["running"] is True and "line 1" in value["output"]
-    ended = await commands.output(value["handle"], value["nextByte"], 10)
-    assert ended["running"] is False and ended["exitCode"] == 0
+    value = await commands.run(
+        folder="w",
+        cwd=str(tmp_path),
+        command=lines(3) + "; " + hold + "; echo after-release",
+        budget=0.05,
+    )
+    try:
+        deadline = time.perf_counter() + 10
+        while "line 3" not in value["output"]:
+            assert value["running"] is True and time.perf_counter() < deadline, value
+            await asyncio.sleep(0.02)
+            value = await commands.output(value["handle"], 0, 0)
+        assert value["running"] is True and "line 1" in value["output"]
+        (tmp_path / "release.txt").write_text("go", encoding="utf-8")
+        ended = await commands.output(value["handle"], value["nextByte"], 10)
+        assert ended["running"] is False and ended["exitCode"] == 0
+        assert "after-release" in ended["output"] and "line 1" not in ended["output"]
+    finally:
+        await commands.stop(value["handle"])
 
 
 async def test_a_command_past_its_limit_is_stopped(

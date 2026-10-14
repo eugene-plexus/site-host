@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import pytest
@@ -51,6 +52,30 @@ def test_health_names_the_site_and_nothing_else(tmp_path: Path) -> None:
         "site": ENROLLMENT.site,
         "lastContactAt": None,
     }
+
+
+@pytest.mark.parametrize("operation", ["read_text", "stat"])
+def test_enrollment_read_failure_names_only_site_json(tmp_path, monkeypatch, caplog, operation):
+    settings = settings_for(tmp_path)
+    path = settings.data_dir / "site.json"
+    original = getattr(Path, operation)
+
+    def denied(self, *args, **kwargs):
+        if self == path:
+            raise PermissionError(13, "Permission denied", str(path))
+        return original(self, *args, **kwargs)
+
+    app = create_app(settings, channel=Idle())
+    stamp = path.stat().st_mtime + 5
+    os.utime(path, (stamp, stamp))
+    monkeypatch.setattr(Path, operation, denied)
+    with TestClient(app) as client:
+        answer = client.get("/healthz")
+    assert answer.status_code == 503
+    reason = answer.json()["reason"]
+    assert "site.json" in reason and "Permission denied" in reason
+    assert tmp_path.name not in reason
+    assert str(path) in caplog.text
 
 
 def test_health_before_the_join_and_without_a_channel_for_workers(tmp_path: Path) -> None:

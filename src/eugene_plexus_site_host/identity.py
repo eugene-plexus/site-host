@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import base64
 import json
+import logging
 import secrets
 import time
 from dataclasses import asdict, dataclass
@@ -46,6 +47,17 @@ AUDIENCE = "control"
 
 class IdentityError(Exception):
     """This site's enrollment on disk is missing or unusable; the message says which."""
+
+
+def _unreadable_enrollment(path: Path, exc: Exception) -> IdentityError:
+    logging.getLogger(__name__).error("Cannot read enrollment %s: %s", path, exc)
+    if isinstance(exc, OSError):
+        cause = exc.strerror or type(exc).__name__
+    elif isinstance(exc, UnicodeError):
+        cause = "invalid text encoding"
+    else:
+        cause = f"{type(exc).__name__}: {exc}"
+    return IdentityError(f"{path.name}: this site's enrollment is unreadable ({cause})")
 
 
 @dataclass(frozen=True)
@@ -100,13 +112,15 @@ class Identity:
         except FileNotFoundError:
             self._cached = None
             return None
+        except OSError as exc:
+            raise _unreadable_enrollment(path, exc) from None
         if self._cached is not None and self._cached[0] == stamp:
             return self._cached[1]
         try:
             raw: dict[str, Any] = json.loads(path.read_text(encoding="utf-8"))
             enrollment = Enrollment(**{k: str(raw[k]) for k in Enrollment.__dataclass_fields__})
         except (OSError, ValueError, KeyError, TypeError) as exc:
-            raise IdentityError(f"this site's enrollment file is unreadable: {exc}") from None
+            raise _unreadable_enrollment(path, exc) from None
         self._cached = (stamp, enrollment)
         self._key = None
         return enrollment
