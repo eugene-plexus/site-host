@@ -42,6 +42,14 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, windows-latest]
+    # bash on Windows too, for every step (W0.13). The runner's default pwsh
+    # fails a step only on the exit code of its last native command: a block
+    # with a failing command followed by a passing one is green. The agent's
+    # Windows pytest step reported success with 2 failed tests under it.
+    # bash -e -o pipefail stops at the first failing command.
+    defaults:
+      run:
+        shell: bash
     steps:
       - uses: actions/checkout@v6
 
