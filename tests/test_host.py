@@ -19,6 +19,31 @@ from .conftest import ADA, BO, OpenSite, Site, rpc, settings_for
 FILES = "files"
 
 
+@pytest.mark.parametrize("size", [8 * 1024 * 1024 - 100, 8 * 1024 * 1024, 9 * 1024 * 1024])
+async def test_a_tool_answer_up_to_8_mib_passes(
+    site: Site, folder: Path, monkeypatch: pytest.MonkeyPatch, size: int
+) -> None:
+    await add(site, folder)
+    assert site.worker is not None
+
+    async def answer(*_args: Any, **_kwargs: Any) -> dict[str, Any]:
+        return {
+            "response": {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "result": {"content": [{"type": "text", "text": "x" * size}]},
+            }
+        }
+
+    monkeypatch.setattr(site.worker, "handle", answer)
+    result = await site.mcp(ADA, FILES, "tools/call", read())
+    if size < 8 * 1024 * 1024:
+        assert result["status"] == "done", result.get("message")
+    else:
+        assert result["status"] == "failed"
+        assert result["message"] == "The answer is larger than 8 MiB. Ask for less."
+
+
 async def add(site: Site, folder: Path, *, name: str = "Notes", writable: bool = False) -> str:
     added = await site.add_workspace(ADA, name=name, path=str(folder), writable=writable)
     assert added["status"] == "done", added

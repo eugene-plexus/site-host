@@ -1,7 +1,8 @@
 """The local channel between the site host and each person's worker (§3.2).
 
 A named pipe on Windows, a Unix socket elsewhere, carrying newline-delimited
-JSON, each frame at most `MAX_FRAME` bytes. **Who is at the other end is read
+JSON, each frame at most `MAX_FRAME` bytes, except tool answers (8 MiB
+plus their channel envelope). **Who is at the other end is read
 from the connection, never from what it says:**
 
 - the site host learns each worker's account from the operating system
@@ -36,6 +37,7 @@ from collections.abc import Callable, Coroutine
 from typing import Any
 
 MAX_FRAME = 256 * 1024
+MAX_RESULT_FRAME = 8 * 1024 * 1024 + 4096
 HELLO_SECONDS = 5.0
 
 
@@ -45,9 +47,22 @@ class ChannelError(Exception):
 
 def encode(message: dict[str, Any]) -> bytes:
     data = (json.dumps(message, separators=(",", ":"), ensure_ascii=False) + "\n").encode()
-    if len(data) > MAX_FRAME:
-        raise ChannelError("A message on the local channel is larger than 256 KiB.")
+    _check_size(message, len(data))
     return data
+
+
+def _check_size(message: dict[str, Any], size: int) -> None:
+    response = message.get("response")
+    result = response.get("result") if isinstance(response, dict) else None
+    tool_result = (
+        message.get("t") == "result"
+        and isinstance(result, dict)
+        and isinstance(result.get("content"), list)
+    )
+    limit = MAX_RESULT_FRAME if tool_result else MAX_FRAME
+    if size > limit:
+        words = "8 MiB plus its envelope" if tool_result else "256 KiB"
+        raise ChannelError(f"A message on the local channel is larger than {words}.")
 
 
 def decode(line: bytes) -> dict[str, Any]:
@@ -57,6 +72,7 @@ def decode(line: bytes) -> dict[str, Any]:
         raise ChannelError("The other end sent something that is not JSON.") from None
     if not isinstance(value, dict):
         raise ChannelError("The other end sent something that is not a message.")
+    _check_size(value, len(line))
     return value
 
 
@@ -124,7 +140,9 @@ class _StreamConnection(Connection):
                 raise ChannelError("The other end stopped in the middle of a message.") from None
             return None
         except asyncio.LimitOverrunError:
-            raise ChannelError("A message on the local channel is larger than 256 KiB.") from None
+            raise ChannelError(
+                "A message on the local channel is larger than 8 MiB plus its envelope."
+            ) from None
         except (ConnectionError, OSError):
             return None
         return decode(line)
@@ -167,7 +185,7 @@ if sys.platform != "win32":
                 return
             await accept(conn)
 
-        server = await asyncio.start_unix_server(handle, path=path, limit=MAX_FRAME + 1)
+        server = await asyncio.start_unix_server(handle, path=path, limit=MAX_RESULT_FRAME + 1)
         # Connecting needs write permission on the socket; who may stay is the
         # peer check's to decide, not the file mode's.
         os.chmod(path, 0o666)
@@ -175,7 +193,7 @@ if sys.platform != "win32":
 
     async def _connect_posix(path: str, host: str) -> Connection:
         try:
-            reader, writer = await asyncio.open_unix_connection(path, limit=MAX_FRAME + 1)
+            reader, writer = await asyncio.open_unix_connection(path, limit=MAX_RESULT_FRAME + 1)
         except FileNotFoundError:
             raise ChannelError("The site host is not running.") from None
         except OSError as exc:
@@ -534,8 +552,10 @@ if sys.platform == "win32":
 
         async def receive(self) -> dict[str, Any] | None:
             while b"\n" not in self._buffer:
-                if len(self._buffer) > MAX_FRAME:
-                    raise ChannelError("A message on the local channel is larger than 256 KiB.")
+                if len(self._buffer) > MAX_RESULT_FRAME:
+                    raise ChannelError(
+                        "A message on the local channel is larger than 8 MiB plus its envelope."
+                    )
                 chunk = await self._queue.get()
                 if not chunk:
                     if self._buffer:
@@ -544,8 +564,6 @@ if sys.platform == "win32":
                 self._buffer += chunk
             line, _, rest = bytes(self._buffer).partition(b"\n")
             self._buffer = bytearray(rest)
-            if len(line) + 1 > MAX_FRAME:
-                raise ChannelError("A message on the local channel is larger than 256 KiB.")
             return decode(line)
 
         async def send(self, message: dict[str, Any]) -> None:

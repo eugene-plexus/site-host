@@ -308,7 +308,8 @@ async def test_a_first_frame_over_the_limit_is_dropped_at_once(harness: Harness)
 async def test_bytes_with_no_end_of_line_are_refused_at_the_limit(harness: Harness) -> None:
     client = await local_channel.connect(harness.channel, local_channel.own_account(), {})
     server_side = await harness.next()
-    await raw_send(client, b"x" * (MAX_FRAME + 10))
-    with pytest.raises(ChannelError, match="256 KiB"):
+    sending = asyncio.create_task(raw_send(client, b"x" * (local_channel.MAX_RESULT_FRAME + 10)))
+    with pytest.raises(ChannelError, match="8 MiB"):
         await asyncio.wait_for(server_side.receive(), 10)
+    await sending
     await client.close()

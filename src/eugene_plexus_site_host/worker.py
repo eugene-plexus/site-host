@@ -238,13 +238,20 @@ class Worker:
             try:
                 await conn.send(reply)
             except local_channel.ChannelError:
+                request = message.get("request")
+                tool_answer = (
+                    message.get("op") == "mcp"
+                    and isinstance(request, dict)
+                    and request.get("method") == "tools/call"
+                )
                 await conn.send(
                     {
                         "t": "result",
                         "id": ident,
                         "ok": False,
-                        "message": "The answer is larger than the local channel carries. "
-                        "Ask for less.",
+                        "message": "The answer is larger than 8 MiB. Ask for less."
+                        if tool_answer
+                        else "The answer is larger than the local channel carries. Ask for less.",
                     }
                 )
 

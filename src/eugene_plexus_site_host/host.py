@@ -123,6 +123,7 @@ log = logging.getLogger(__name__)
 
 PROTOCOL = "mcp-2026-07-28"
 MAX_ANSWER = 70_000
+MAX_TOOL_ANSWER = 8 * 1024 * 1024
 OPERATOR = "operator"
 FILES = file_server.SERVER
 #: The `_meta` key on each tool `tools/list` returns: where Workbench must ask.
@@ -627,8 +628,10 @@ class Host:
                 kept.append({**offered, "_meta": meta})
             response["result"]["tools"] = kept
         status = "uncertain" if uncertain else "done"
-        if len(json.dumps(response, ensure_ascii=False).encode()) > MAX_ANSWER:
-            message = "The answer is larger than 70,000 bytes. Ask for less."
+        limit = MAX_TOOL_ANSWER if method == "tools/call" else MAX_ANSWER
+        if len(json.dumps(response, ensure_ascii=False).encode()) > limit:
+            size = "8 MiB" if method == "tools/call" else "70,000 bytes"
+            message = f"The answer is larger than {size}. Ask for less."
             self.audit.record(**entry, decision="allowed", outcome="failed", reason=message)
             return {
                 "status": "uncertain" if status == "uncertain" else "failed",
