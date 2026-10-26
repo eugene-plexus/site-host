@@ -25,6 +25,14 @@ def lines(count: int) -> str:
     return f"for i in $(seq 1 {count}); do echo line $i; done"
 
 
+async def finished(commands: cmd.Commands, value: dict[str, Any]) -> dict[str, Any]:
+    """The command's answer once it has ended: a slow runner's shell can still
+    be starting when the call's budget runs out, so wait on the command."""
+    if value["running"]:
+        value = await commands.output(value["handle"], 0, 60)
+    return value
+
+
 class Fake:
     """A finished command's buffers, without a process."""
 
@@ -89,6 +97,7 @@ async def test_a_command_runs_where_it_was_started_and_its_exit_code_is_kept(
     value = await commands.run(
         folder="w", cwd=str(tmp_path), command="echo inside > here.txt; exit 4", budget=10
     )
+    value = await finished(commands, value)
     assert value["exitCode"] == 4 and value["running"] is False
     assert (tmp_path / "here.txt").exists()
 
@@ -97,7 +106,9 @@ async def test_a_programs_own_exit_code_is_passed_through(tmp_path: Path) -> Non
     """The last program's code, not the shell's: PowerShell's `-Command`
     would say 1 for `cmd /c exit 7`."""
     probe = "cmd /c exit 7" if sys.platform == "win32" else "sh -c 'exit 7'"
-    value = await cmd.Commands().run(folder="w", cwd=str(tmp_path), command=probe, budget=10)
+    commands = cmd.Commands()
+    value = await commands.run(folder="w", cwd=str(tmp_path), command=probe, budget=10)
+    value = await finished(commands, value)
     assert value["exitCode"] == 7
 
 
@@ -110,8 +121,10 @@ async def test_eugenes_own_variables_do_not_reach_a_command(
         if sys.platform == "win32"
         else "echo $EUGENE_PLEXUS_SECRET_THING"
     )
-    value = await cmd.Commands().run(folder="w", cwd=str(tmp_path), command=probe, budget=10)
-    assert "leaked" not in value["output"]
+    commands = cmd.Commands()
+    value = await commands.run(folder="w", cwd=str(tmp_path), command=probe, budget=10)
+    value = await finished(commands, value)
+    assert value["running"] is False and "leaked" not in value["output"]
 
 
 async def test_a_long_command_is_followed_by_its_handle_and_its_output_read_on(
@@ -148,7 +161,9 @@ async def test_a_command_past_its_limit_is_stopped(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setattr(cmd, "LIMIT_SECONDS", 1.0)
-    value = await cmd.Commands().run(folder="w", cwd=str(tmp_path), command=sleeping(30), budget=8)
+    commands = cmd.Commands()
+    value = await commands.run(folder="w", cwd=str(tmp_path), command=sleeping(30), budget=8)
+    value = await finished(commands, value)
     assert value["running"] is False and value["stopped"] == "limit"
 
 
@@ -183,9 +198,11 @@ async def test_what_a_command_leaves_running_stops_when_it_ends(tmp_path: Path) 
         )
     else:
         child = f"(sleep 2; echo orphan > '{marker}') &"
-    value = await cmd.Commands().run(
+    commands = cmd.Commands()
+    value = await commands.run(
         folder="w", cwd=str(tmp_path), command=child + "\necho left", budget=10
     )
+    value = await finished(commands, value)
     assert value["running"] is False and "left" in value["output"]
     await asyncio.sleep(3)
     assert not marker.exists()
